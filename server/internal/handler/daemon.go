@@ -36,6 +36,7 @@ import (
 	"github.com/multica-ai/multica/server/pkg/redact"
 	"github.com/multica-ai/multica/server/pkg/skillbundle"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
+	"github.com/multica-ai/multica/server/internal/modelrouter"
 )
 
 // ---------------------------------------------------------------------------
@@ -2142,6 +2143,9 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
 			resp.WorkspaceID = uuidToString(issue.WorkspaceID)
 			resp.ThreadName = issue.Title
+			chosenModel, routingReason := modelrouter.SelectModel(runtime.Provider, issue.Title, resp.Agent.Model)
+			resp.Agent.Model = chosenModel
+			slog.Info("model router", "task_id", uuidToString(task.ID), "model", chosenModel, "reason", routingReason)
 
 			// Squad-leader briefing injection: keyed off the task being a
 			// leader-task (is_leader_task) carrying a squad_id — NOT off the
