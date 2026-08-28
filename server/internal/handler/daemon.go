@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/cerebra"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
@@ -618,6 +619,12 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 					0,
 				))
 			}
+		}
+
+		// Cerebra: Trigger model discovery for newly registered runtimes
+		// This auto-populates tier_model_map based on available models
+		if inserted && registered.Status == "online" {
+			go h.triggerModelDiscovery(r.Context(), uuid.UUID(registered.ID.Bytes), req.WorkspaceID)
 		}
 
 		// Seamless migration from the previous hostname-derived identity. The
@@ -5155,4 +5162,403 @@ func (h *Handler) GetTaskGCCheck(w http.ResponseWriter, r *http.Request) {
 		"status":       task.Status,
 		"completed_at": task.CompletedAt.Time,
 	})
+}
+
+// triggerModelDiscovery initiates model discovery for a newly registered runtime.
+// This runs asynchronously to avoid blocking daemon registration.
+// It requests the model list from the runtime and auto-populates tier_model_map.
+func (h *Handler) triggerModelDiscovery(ctx context.Context, runtimeID uuid.UUID, workspaceID string) {
+	// Wrap in recover to prevent panics from crashing daemon
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("cerebra: model discovery panicked",
+				"runtime_id", runtimeID.String(),
+				"panic", r,
+			)
+		}
+	}()
+
+	// Create a new context with timeout to prevent goroutine leaks
+	discoveryCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	slog.Info("cerebra: triggering automatic model discovery",
+		"runtime_id", runtimeID.String(),
+		"workspace_id", workspaceID,
+	)
+
+	// Skip if ModelListStore is not available (shouldn't happen in production)
+	if h.ModelListStore == nil {
+		slog.Warn("cerebra: ModelListStore not available, skipping auto-discovery",
+			"runtime_id", runtimeID.String(),
+		)
+		return
+	}
+
+	// Step 1: Create model list request (enqueues for daemon to pick up)
+	runtimeIDStr := runtimeID.String()
+	req, err := h.ModelListStore.Create(discoveryCtx, runtimeIDStr)
+	if err != nil {
+		slog.Error("cerebra: failed to create model list request",
+			"runtime_id", runtimeIDStr,
+			"error", err,
+		)
+		return
+	}
+
+	slog.Debug("cerebra: model list request created",
+		"runtime_id", runtimeIDStr,
+		"request_id", req.ID,
+	)
+
+	// Step 2: Notify daemon to heartbeat now (wake up daemon)
+	h.requestDaemonPendingWork(runtimeIDStr, protocol.PendingWorkKindModelList)
+
+	// Step 3: Poll for response with timeout
+	models, err := h.waitForModelListResponse(discoveryCtx, req.ID, 45*time.Second)
+	if err != nil {
+		slog.Warn("cerebra: model list response timeout or error, skipping auto-discovery",
+			"runtime_id", runtimeIDStr,
+			"request_id", req.ID,
+			"error", err,
+		)
+		return
+	}
+
+	if len(models) == 0 {
+		slog.Warn("cerebra: runtime returned empty model list, skipping auto-discovery",
+			"runtime_id", runtimeIDStr,
+		)
+		return
+	}
+
+	slog.Info("cerebra: received model list from runtime",
+		"runtime_id", runtimeIDStr,
+		"models_count", len(models),
+	)
+
+	// Step 4: Convert to DiscoveredModel format
+	discoveredModels := make([]cerebra.DiscoveredModel, len(models))
+	for i, model := range models {
+		discoveredModels[i] = cerebra.DiscoveredModel{
+			ID:           model.ID,
+			Name:         model.Label,
+			InferredTier: cerebra.InferTierFromModelName(model.ID),
+		}
+	}
+
+	// Step 5: Call discovery service to classify and assign tiers
+	discovery := cerebra.NewModelDiscovery(h.Queries)
+	count, err := discovery.DiscoverAndAssignTiers(discoveryCtx, runtimeID, discoveredModels)
+	if err != nil {
+		slog.Error("cerebra: automatic model discovery failed",
+			"runtime_id", runtimeIDStr,
+			"error", err,
+		)
+		return
+	}
+
+	slog.Info("cerebra: automatic model discovery complete",
+		"runtime_id", runtimeIDStr,
+		"models_discovered", count,
+	)
+}
+
+// waitForModelListResponse polls for model list response with timeout
+func (h *Handler) waitForModelListResponse(ctx context.Context, requestID string, timeout time.Duration) ([]ModelEntry, error) {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("timeout waiting for model list response")
+			}
+
+			req, err := h.ModelListStore.Get(ctx, requestID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get request status: %w", err)
+			}
+
+			if req == nil {
+				return nil, fmt.Errorf("request not found")
+			}
+
+			switch req.Status {
+			case ModelListCompleted:
+				return req.Models, nil
+			case ModelListFailed, ModelListTimeout:
+				return nil, fmt.Errorf("model list request failed: %s", req.Error)
+			case ModelListPending, ModelListRunning:
+				// Continue polling
+				continue
+			default:
+				return nil, fmt.Errorf("unknown request status: %s", req.Status)
+			}
+		}
+	}
+}
+
+// RefreshRuntimeModels manually triggers model discovery for a runtime.
+// POST /api/runtimes/:id/discover-models
+func (h *Handler) RefreshRuntimeModels(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	if !ok {
+		return
+	}
+
+	// Verify runtime exists and caller has access
+	runtime, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "runtime not found")
+		} else {
+			slog.Error("GetAgentRuntime failed", "runtime_id", runtimeID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load runtime")
+		}
+		return
+	}
+
+	// Verify workspace access
+	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(runtime.WorkspaceID)) {
+		return
+	}
+
+	// Parse request body with model list
+	var req struct {
+		Models []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if len(req.Models) == 0 {
+		writeError(w, http.StatusBadRequest, "models array is required and cannot be empty")
+		return
+	}
+
+	// Convert to DiscoveredModel format
+	discoveredModels := make([]cerebra.DiscoveredModel, len(req.Models))
+	for i, m := range req.Models {
+		discoveredModels[i] = cerebra.DiscoveredModel{
+			ID:           m.ID,
+			Name:         m.Name,
+			InferredTier: cerebra.InferTierFromModelName(m.ID),
+		}
+	}
+
+	// Trigger model discovery
+	discovery := cerebra.NewModelDiscovery(h.Queries)
+	count, err := discovery.DiscoverAndAssignTiers(r.Context(), uuid.UUID(runtimeUUID.Bytes), discoveredModels)
+	if err != nil {
+		slog.Error("model discovery failed", "runtime_id", runtimeID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to discover models")
+		return
+	}
+
+	slog.Info("cerebra: manual model discovery completed",
+		"runtime_id", runtimeID,
+		"models_discovered", count,
+	)
+
+	// Return the updated runtime with new tier_model_map
+	updated, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load updated runtime")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"runtime":           runtimeToResponse(updated),
+		"models_count":      count,
+		"discovered_models": discoveredModels,
+	})
+}
+
+// SetIssueSessionModel updates the session_model for an issue (Cerebra session affinity).
+// Called by daemon after routing decision on first turn of a conversation.
+func (h *Handler) SetIssueSessionModel(w http.ResponseWriter, r *http.Request) {
+	issueID := chi.URLParam(r, "issueId")
+	issueUUID, ok := parseUUIDOrBadRequest(w, issueID, "issue_id")
+	if !ok {
+		return
+	}
+
+	// Load issue and verify daemon has access to its workspace
+	issue, err := h.Queries.GetIssue(r.Context(), issueUUID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "issue not found")
+		} else {
+			slog.Error("GetIssue failed", "issue_id", issueID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load issue")
+		}
+		return
+	}
+
+	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(issue.WorkspaceID)) {
+		return
+	}
+
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.Model == "" {
+		writeError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+
+	// Update session model
+	if err := h.Queries.SetIssueSessionModel(r.Context(), db.SetIssueSessionModelParams{
+		ID:           issueUUID,
+		SessionModel: pgtype.Text{String: req.Model, Valid: true},
+	}); err != nil {
+		slog.Error("SetIssueSessionModel failed", "issue_id", issueID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to update session model")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GetIssueSessionModel retrieves the session_model for an issue (Cerebra session affinity).
+// Called by daemon before routing to check if conversation has established model preference.
+func (h *Handler) GetIssueSessionModel(w http.ResponseWriter, r *http.Request) {
+	issueID := chi.URLParam(r, "issueId")
+	issueUUID, ok := parseUUIDOrBadRequest(w, issueID, "issue_id")
+	if !ok {
+		return
+	}
+
+	// Load issue and verify daemon has access to its workspace
+	issue, err := h.Queries.GetIssue(r.Context(), issueUUID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "issue not found")
+		} else {
+			slog.Error("GetIssue failed", "issue_id", issueID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load issue")
+		}
+		return
+	}
+
+	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(issue.WorkspaceID)) {
+		return
+	}
+
+	// Return session model (may be empty string if not yet set)
+	resp := struct {
+		SessionModel string `json:"session_model"`
+	}{
+		SessionModel: issue.SessionModel.String,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode GetIssueSessionModel response", "error", err)
+	}
+}
+
+// GetChatSessionModel retrieves the session_model for a chat session (Cerebra session affinity).
+// Called by daemon before routing to check if conversation has established model preference.
+func (h *Handler) GetChatSessionModel(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionId")
+	sessionUUID, ok := parseUUIDOrBadRequest(w, sessionID, "session_id")
+	if !ok {
+		return
+	}
+
+	// Load chat session and verify daemon has access to its workspace
+	session, err := h.Queries.GetChatSession(r.Context(), sessionUUID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "chat session not found")
+		} else {
+			slog.Error("GetChatSession failed", "session_id", sessionID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load chat session")
+		}
+		return
+	}
+
+	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(session.WorkspaceID)) {
+		return
+	}
+
+	// Return session model (may be empty string if not yet set)
+	resp := struct {
+		SessionModel string `json:"session_model"`
+	}{
+		SessionModel: session.SessionModel.String,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode GetChatSessionModel response", "error", err)
+	}
+}
+
+// SetChatSessionModel updates the session_model for a chat session (Cerebra session affinity).
+// Called by daemon after routing decision on first turn of a conversation.
+func (h *Handler) SetChatSessionModel(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionId")
+	sessionUUID, ok := parseUUIDOrBadRequest(w, sessionID, "session_id")
+	if !ok {
+		return
+	}
+
+	// Load chat session and verify daemon has access to its workspace
+	session, err := h.Queries.GetChatSession(r.Context(), sessionUUID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "chat session not found")
+		} else {
+			slog.Error("GetChatSession failed", "session_id", sessionID, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load chat session")
+		}
+		return
+	}
+
+	if !h.requireDaemonWorkspaceAccess(w, r, uuidToString(session.WorkspaceID)) {
+		return
+	}
+
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.Model == "" {
+		writeError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+
+	// Update session model
+	if err := h.Queries.SetChatSessionModel(r.Context(), db.SetChatSessionModelParams{
+		ID:           sessionUUID,
+		SessionModel: pgtype.Text{String: req.Model, Valid: true},
+	}); err != nil {
+		slog.Error("SetChatSessionModel failed", "session_id", sessionID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to update session model")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }

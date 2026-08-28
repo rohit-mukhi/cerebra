@@ -1,0 +1,11 @@
+Practical answer: yes, but do it in phases, not all at once.
+
+Phase 1 (new files only) — migrations + cerebra package + SQL queries. Zero risk, no large file reads needed.
+
+Phase 2 (small modifications) — helpers.go (111 lines), execenv.go (targeted section). Low risk.
+
+Phase 3 (daemon wiring) — read only the New() and task dispatch sections of daemon.go, not the whole file.
+
+Phase 4 (handler) — runtime.go targeted section for the API endpoint.
+
+

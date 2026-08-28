@@ -1182,3 +1182,67 @@ func (c *Client) InvokeAgentPluginHook(ctx context.Context, daemonToken, taskID,
 	}
 	return response.Output, nil
 }
+
+// GetRuntimeModelMaps fetches the Cerebra model routing configuration for a runtime.
+// Returns tier_model_map and semantic_model_map for use in dynamic model routing.
+func (c *Client) GetRuntimeModelMaps(ctx context.Context, runtimeID string) (map[string]string, map[string]string, error) {
+	var resp struct {
+		TierModelMap     map[string]string `json:"tier_model_map"`
+		SemanticModelMap map[string]string `json:"semantic_model_map"`
+	}
+	if err := c.getJSON(ctx, fmt.Sprintf("/api/runtimes/%s/model-maps", runtimeID), &resp); err != nil {
+		return nil, nil, err
+	}
+	return resp.TierModelMap, resp.SemanticModelMap, nil
+}
+
+// MarkModelUnavailable tells the server to temporarily mark a model as unavailable
+// due to quota/rate limits. The server will avoid routing to this model for the
+// specified TTL duration.
+func (c *Client) MarkModelUnavailable(ctx context.Context, runtimeID, model string, ttlSeconds int) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/runtimes/%s/models/%s/unavailable", runtimeID, url.PathEscape(model)), map[string]any{
+		"ttl_seconds": ttlSeconds,
+	}, nil)
+}
+
+// SetIssueSessionModel updates the session_model for an issue (Cerebra session affinity).
+// Called after routing decision on first turn of a conversation.
+func (c *Client) SetIssueSessionModel(ctx context.Context, issueID, model string) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/issues/%s/session-model", issueID), map[string]any{
+		"model": model,
+	}, nil)
+}
+
+// SetChatSessionModel updates the session_model for a chat session (Cerebra session affinity).
+// Called after routing decision on first turn of a conversation.
+func (c *Client) SetChatSessionModel(ctx context.Context, sessionID, model string) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/chat-sessions/%s/session-model", sessionID), map[string]any{
+		"model": model,
+	}, nil)
+}
+
+// GetIssueSessionModel retrieves the session_model for an issue (Cerebra session affinity).
+// Called before routing to check if conversation has established model preference.
+// Returns empty string if no session model has been set yet.
+func (c *Client) GetIssueSessionModel(ctx context.Context, issueID string) (string, error) {
+	var resp struct {
+		SessionModel string `json:"session_model"`
+	}
+	if err := c.getJSON(ctx, fmt.Sprintf("/api/daemon/issues/%s/session-model", issueID), &resp); err != nil {
+		return "", err
+	}
+	return resp.SessionModel, nil
+}
+
+// GetChatSessionModel retrieves the session_model for a chat session (Cerebra session affinity).
+// Called before routing to check if conversation has established model preference.
+// Returns empty string if no session model has been set yet.
+func (c *Client) GetChatSessionModel(ctx context.Context, sessionID string) (string, error) {
+	var resp struct {
+		SessionModel string `json:"session_model"`
+	}
+	if err := c.getJSON(ctx, fmt.Sprintf("/api/daemon/chat-sessions/%s/session-model", sessionID), &resp); err != nil {
+		return "", err
+	}
+	return resp.SessionModel, nil
+}

@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/multica-ai/multica/server/internal/cerebra"
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
@@ -601,6 +602,10 @@ type Daemon struct {
 	// New() and overridable in tests so the auto-update poller can be exercised
 	// without touching the real network or the brew CLI.
 	runUpdateFn func(targetVersion string) (string, error)
+
+	// cerebraLogParser parses task logs for quota/rate limit signals.
+	// Used to mark models unavailable when tasks fail due to quota exhaustion.
+	cerebraLogParser *cerebra.LogParser
 }
 
 type profileLaunchSpec struct {
@@ -660,6 +665,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	d.executionEnvironmentCommand = defaultExecutionEnvironmentCommand
 	d.runner = taskRunnerFunc(d.runTask)
 	d.runUpdateFn = d.runUpdate
+	d.cerebraLogParser = cerebra.NewLogParser()
 	return d
 }
 
@@ -7393,6 +7399,121 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		model = entry.Model
 	}
 
+	// Cerebra dynamic model routing: override model based on task complexity/domain
+	// Phase 5: Check for existing session affinity first, then route if needed
+	if task.RuntimeID != "" && d.client != nil {
+		// Step 1: Check for existing session model (session affinity)
+		var sessionModel string
+		var sessionTier cerebra.Tier
+		if task.IssueID != "" {
+			if sm, err := d.client.GetIssueSessionModel(ctx, task.IssueID); err != nil {
+				taskLog.Warn("cerebra: failed to get issue session model", "error", err)
+			} else if sm != "" {
+				sessionModel = sm
+				sessionTier = cerebra.InferTierFromModel(sm)
+				taskLog.Debug("cerebra: found existing issue session model",
+					"session_model", sessionModel,
+					"session_tier", sessionTier,
+				)
+			}
+		} else if task.ChatSessionID != "" {
+			if sm, err := d.client.GetChatSessionModel(ctx, task.ChatSessionID); err != nil {
+				taskLog.Warn("cerebra: failed to get chat session model", "error", err)
+			} else if sm != "" {
+				sessionModel = sm
+				sessionTier = cerebra.InferTierFromModel(sm)
+				taskLog.Debug("cerebra: found existing chat session model",
+					"session_model", sessionModel,
+					"session_tier", sessionTier,
+				)
+			}
+		}
+
+		// Step 2: Fetch model maps for routing decision
+		tierModelMap, semanticModelMap, err := d.client.GetRuntimeModelMaps(ctx, task.RuntimeID)
+		if err != nil {
+			// Non-fatal: log and continue with original model selection
+			taskLog.Warn("cerebra: failed to fetch model maps; continuing with static model", "error", err)
+		} else if len(tierModelMap) > 0 || len(semanticModelMap) > 0 {
+			// Extract prompt for routing
+			prompt := buildRoutingPrompt(task)
+			if prompt != "" {
+				// Determine the tier of the current prompt
+				scorer := cerebra.NewScorer()
+				promptTier := scorer.Score(prompt)
+
+				// Step 3: Apply session affinity with escalation logic
+				if sessionModel != "" {
+					// Compare prompt tier vs session tier
+					comparison := cerebra.CompareTiers(promptTier, sessionTier)
+					if comparison > 0 {
+						// Escalation needed: prompt tier > session tier
+						taskLog.Info("cerebra: escalating from session model (higher complexity detected)",
+							"session_model", sessionModel,
+							"session_tier", sessionTier,
+							"prompt_tier", promptTier,
+						)
+						// Continue with routing to get stronger model
+					} else {
+						// Reuse session model (affinity holds, no de-escalation)
+						taskLog.Info("cerebra: reusing session model (affinity)",
+							"session_model", sessionModel,
+							"session_tier", sessionTier,
+							"prompt_tier", promptTier,
+						)
+						model = sessionModel
+						// Skip routing entirely - affinity takes precedence
+						goto skipRouting
+					}
+				}
+
+				// Step 4: Perform routing (first turn OR escalation needed)
+				// Try semantic routing first (priority)
+				if len(semanticModelMap) > 0 {
+					semanticRouter := cerebra.NewSemanticRouter(semanticModelMap)
+					if match := semanticRouter.Match(prompt); match != nil && match.Model != "" {
+						taskLog.Info("cerebra: semantic routing selected model",
+							"original_model", model,
+							"routed_model", match.Model,
+							"domain", match.Domain,
+							"confidence", match.Confidence,
+						)
+						model = match.Model
+					}
+				}
+
+				// Fallback to tier routing if semantic didn't match
+				if model == entry.Model && len(tierModelMap) > 0 {
+					if tierModel, exists := tierModelMap[string(promptTier)]; exists {
+						taskLog.Info("cerebra: tier routing selected model",
+							"original_model", model,
+							"routed_model", tierModel,
+							"tier", promptTier,
+						)
+						model = tierModel
+					}
+				}
+
+			skipRouting:
+				// Step 5: Update session model for future turns
+				// (only for issue/chat tasks, only if model was determined)
+				if task.IssueID != "" {
+					if err := d.client.SetIssueSessionModel(ctx, task.IssueID, model); err != nil {
+						taskLog.Warn("cerebra: failed to update issue session model; session affinity may not work", "error", err)
+					} else {
+						taskLog.Debug("cerebra: updated issue session model", "issue_id", task.IssueID, "model", model)
+					}
+				} else if task.ChatSessionID != "" {
+					if err := d.client.SetChatSessionModel(ctx, task.ChatSessionID, model); err != nil {
+						taskLog.Warn("cerebra: failed to update chat session model; session affinity may not work", "error", err)
+					} else {
+						taskLog.Debug("cerebra: updated chat session model", "session_id", task.ChatSessionID, "model", model)
+					}
+				}
+			}
+		}
+	}
+
 	taskLog.Info("starting agent",
 		"provider", provider,
 		"workdir", env.WorkDir,
@@ -7542,6 +7663,34 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 	if err != nil {
 		return TaskResult{}, err
+	}
+
+	// Parse task output for quota/rate limit signals (Cerebra unavailability tracking)
+	if result.Error != "" || result.Status == "blocked" || result.Status == "failed" {
+		// Parse error output for quota signals
+		logLines := []string{result.Error, result.Output}
+		if d.cerebraLogParser.ShouldMarkUnavailable(logLines) {
+			parseResult := d.cerebraLogParser.ParseString(result.Error + "\n" + result.Output)
+			taskLog.Warn("detected quota/rate limit error in task output",
+				"error_type", parseResult.GetErrorType(),
+				"model", model,
+				"runtime_id", task.RuntimeID,
+			)
+
+			// Mark model as unavailable with default 1-hour TTL
+			if task.RuntimeID != "" && model != "" && d.client != nil {
+				ttlSeconds := 3600 // Default 1 hour
+				if err := d.client.MarkModelUnavailable(ctx, task.RuntimeID, model, ttlSeconds); err != nil {
+					taskLog.Warn("cerebra: failed to mark model unavailable", "error", err, "model", model)
+				} else {
+					taskLog.Info("cerebra: marked model unavailable",
+						"model", model,
+						"ttl_seconds", ttlSeconds,
+						"error_type", parseResult.GetErrorType(),
+					)
+				}
+			}
+		}
 	}
 
 	// retiredSessionID is the session this run was told to resume and then

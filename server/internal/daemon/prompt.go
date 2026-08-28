@@ -168,6 +168,28 @@ func BuildPrompt(task Task, provider string, options ...PromptOption) string {
 	return body
 }
 
+// buildRoutingPrompt extracts the user-provided prompt from task context
+// for Cerebra semantic routing. Returns the first non-empty prompt found.
+func buildRoutingPrompt(task Task) string {
+	if task.TriggerCommentContent != "" {
+		return task.TriggerCommentContent
+	}
+	if task.ChatMessage != "" {
+		return task.ChatMessage
+	}
+	if task.AutopilotDescription != "" {
+		return task.AutopilotDescription
+	}
+	if task.QuickCreatePrompt != "" {
+		return task.QuickCreatePrompt
+	}
+	// Fallback to HandoffNote if nothing else available
+	if task.HandoffNote != "" {
+		return task.HandoffNote
+	}
+	return ""
+}
+
 func buildPromptBody(task Task, provider string) string {
 	if task.ChatSessionID != "" {
 		return buildChatPrompt(task)

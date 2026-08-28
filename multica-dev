@@ -1,0 +1,260 @@
+#!/bin/bash
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+PROJECT_DIR=~/Agentic\ AI\ Programme/Project/multica
+
+# Function: Start Multica
+start_multica() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}  Starting Multica${NC}"
+    echo -e "${BLUE}========================================${NC}"
+
+    cd "$PROJECT_DIR"
+    export DATABASE_URL=postgresql://multica:multica@localhost:5432/multica?sslmode=disable
+
+    # Step 1: PostgreSQL
+    echo -e "\n${YELLOW}[1/5] Checking PostgreSQL container...${NC}"
+    if docker ps | grep -q multica-postgres; then
+        echo -e "${GREEN}✓ PostgreSQL is running${NC}"
+    else
+        echo -e "${YELLOW}Starting PostgreSQL...${NC}"
+        if docker ps -a | grep -q multica-postgres; then
+            docker start multica-postgres
+        else
+            docker run -d --name multica-postgres \
+              -e POSTGRES_USER=multica -e POSTGRES_PASSWORD=multica -e POSTGRES_DB=multica \
+              -p 5432:5432 pgvector/pgvector:pg17
+        fi
+        echo -e "${GREEN}✓ PostgreSQL started${NC}"
+        sleep 5
+    fi
+
+    # Step 2: Server
+    echo -e "\n${YELLOW}[2/5] Checking Multica server...${NC}"
+    if lsof -Pi :8080 -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Server is running${NC}"
+    else
+        echo -e "${YELLOW}Starting server...${NC}"
+        mkdir -p logs
+        cd server
+        nohup ./bin/server > ../logs/server.log 2>&1 &
+        echo $! > ../logs/server.pid
+        cd ..
+        sleep 3
+        if lsof -Pi :8080 -sTCP:LISTEN -t >/dev/null 2>&1; then
+            echo -e "${GREEN}✓ Server started (PID: $(cat logs/server.pid))${NC}"
+        else
+            echo -e "${RED}✗ Server failed. Check logs/server.log${NC}"
+            exit 1
+        fi
+    fi
+
+    # Step 3: OpenClaw wrapper
+    echo -e "\n${YELLOW}[3/5] Checking OpenClaw CLI...${NC}"
+    if command -v openclaw >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ OpenClaw CLI ready${NC}"
+    else
+        echo -e "${YELLOW}Creating OpenClaw wrapper...${NC}"
+        sudo tee /usr/local/bin/openclaw > /dev/null << 'EOF'
+#!/bin/bash
+docker exec -i openclaw-openclaw-cli-1 openclaw "$@"
+EOF
+        sudo chmod +x /usr/local/bin/openclaw
+        echo -e "${GREEN}✓ OpenClaw wrapper created${NC}"
+    fi
+
+    # Step 4: Daemon (local profile)
+    echo -e "\n${YELLOW}[4/5] Checking daemon...${NC}"
+    
+    # Create local profile if doesn't exist
+    LOCAL_PROFILE_DIR=~/.multica/profiles/local-dev
+    if [ ! -d "$LOCAL_PROFILE_DIR" ]; then
+        echo -e "${YELLOW}Creating local development profile...${NC}"
+        mkdir -p "$LOCAL_PROFILE_DIR"
+        cat > "$LOCAL_PROFILE_DIR/config.json" <<'PROFILE_EOF'
+{
+  "server_url": "http://localhost:8080",
+  "token": "local-dev-token"
+}
+PROFILE_EOF
+        echo -e "${GREEN}✓ Local profile created${NC}"
+    fi
+    
+    if pgrep -f "multica daemon.*local-dev" > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ Daemon is running${NC}"
+    else
+        echo -e "${YELLOW}Starting daemon...${NC}"
+        cd server
+        nohup ./bin/multica daemon start --profile local-dev > ../logs/daemon-startup.log 2>&1 &
+        cd ..
+        sleep 3
+        if pgrep -f "multica daemon.*local-dev" > /dev/null 2>&1; then
+            echo -e "${GREEN}✓ Daemon started${NC}"
+        else
+            echo -e "${RED}✗ Daemon failed. Check logs/daemon-startup.log and ~/.multica/profiles/local-dev/daemon.log${NC}"
+            exit 1
+        fi
+    fi
+
+    # Step 5: Configure Cerebra
+    echo -e "\n${YELLOW}[5/5] Configuring Cerebra...${NC}"
+    sleep 2
+    RUNTIME_ID=$(grep "runtime_id=" ~/.multica/profiles/local-dev/daemon.log 2>/dev/null | tail -1 | grep -oP 'runtime_id=\K[a-f0-9-]+' || echo "")
+    
+    if [ -z "$RUNTIME_ID" ]; then
+        echo -e "${YELLOW}⚠ Runtime ID not found. Daemon may still be starting...${NC}"
+        echo -e "${YELLOW}  Check: tail -f ~/.multica/profiles/local-dev/daemon.log${NC}"
+    else
+        echo -e "${BLUE}Runtime ID: ${RUNTIME_ID}${NC}"
+        docker exec multica-postgres psql -U multica -d multica -c \
+            "UPDATE agent_runtime SET tier_model_map = '{\"simple\": \"gpt-4o-mini\", \"standard\": \"gpt-4o\", \"heavy\": \"claude-opus-4-5\"}'::jsonb WHERE id = '${RUNTIME_ID}'::uuid;" >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ Cerebra configured${NC}"
+        else
+            echo -e "${YELLOW}⚠ Failed to set tier_model_map (runtime may not be registered yet)${NC}"
+        fi
+    fi
+
+    # Summary
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Multica is ready! 🚀${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo -e "${BLUE}Services:${NC}"
+    echo -e "  • PostgreSQL:  ${GREEN}running${NC} (port 5432)"
+    echo -e "  • Server:      ${GREEN}running${NC} (http://localhost:8080)"
+    echo -e "  • Daemon:      ${GREEN}running${NC}"
+    [ -n "$RUNTIME_ID" ] && echo -e "  • Runtime ID:  ${BLUE}${RUNTIME_ID}${NC}"
+    echo ""
+    echo -e "${BLUE}Logs:${NC}"
+    echo -e "  • Server:  logs/server.log"
+    echo -e "  • Daemon:  ~/.multica/profiles/local-dev/daemon.log"
+    echo ""
+    echo -e "${BLUE}Commands:${NC}"
+    echo -e "  • Test CLI:    ${YELLOW}cd ~/Agentic\\ AI\\ Programme/Project/multica/server && ./bin/multica agent list --profile local-dev${NC}"
+    echo -e "  • Watch logs:  ${YELLOW}tail -f ~/.multica/profiles/local-dev/daemon.log | grep cerebra${NC}"
+    echo -e "  • Stop:        ${YELLOW}multica-dev stop${NC}"
+    echo ""
+}
+
+# Function: Stop Multica
+stop_multica() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}  Stopping Multica${NC}"
+    echo -e "${BLUE}========================================${NC}"
+
+    cd "$PROJECT_DIR"
+
+    # Stop daemon
+    echo -e "\n${YELLOW}[1/3] Stopping daemon...${NC}"
+    if pgrep -f "multica daemon.*local-dev" > /dev/null 2>&1; then
+        pkill -f "multica daemon.*local-dev"
+        echo -e "${GREEN}✓ Daemon stopped${NC}"
+    else
+        echo -e "${YELLOW}⚠ Daemon not running${NC}"
+    fi
+
+    # Stop server
+    echo -e "\n${YELLOW}[2/3] Stopping server...${NC}"
+    if [ -f logs/server.pid ]; then
+        SERVER_PID=$(cat logs/server.pid)
+        if kill -0 $SERVER_PID 2>/dev/null; then
+            kill $SERVER_PID
+            echo -e "${GREEN}✓ Server stopped (PID: $SERVER_PID)${NC}"
+        else
+            echo -e "${YELLOW}⚠ Server PID not running${NC}"
+        fi
+        rm -f logs/server.pid
+    else
+        if lsof -Pi :8080 -sTCP:LISTEN -t >/dev/null 2>&1; then
+            lsof -ti:8080 | xargs kill -9 2>/dev/null
+            echo -e "${GREEN}✓ Server stopped${NC}"
+        else
+            echo -e "${YELLOW}⚠ Server not running${NC}"
+        fi
+    fi
+
+    # PostgreSQL
+    echo -e "\n${YELLOW}[3/3] PostgreSQL...${NC}"
+    echo -e "${BLUE}Leaving PostgreSQL running (data preserved)${NC}"
+    echo -e "${BLUE}To stop: ${YELLOW}docker stop multica-postgres${NC}"
+
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Multica stopped${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "\n${BLUE}To restart: ${YELLOW}multica-dev start${NC}"
+}
+
+# Function: Show status
+show_status() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}  Multica Status${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo ""
+    
+    # PostgreSQL
+    if docker ps | grep -q multica-postgres; then
+        echo -e "PostgreSQL:  ${GREEN}✓ running${NC}"
+    else
+        echo -e "PostgreSQL:  ${RED}✗ stopped${NC}"
+    fi
+    
+    # Server
+    if lsof -Pi :8080 -sTCP:LISTEN -t >/dev/null 2>&1; then
+        SERVER_PID=$(lsof -ti:8080)
+        echo -e "Server:      ${GREEN}✓ running${NC} (PID: $SERVER_PID, port 8080)"
+    else
+        echo -e "Server:      ${RED}✗ stopped${NC}"
+    fi
+    
+    # Daemon
+    if pgrep -f "multica daemon.*local-dev" > /dev/null 2>&1; then
+        DAEMON_PID=$(pgrep -f "multica daemon.*local-dev")
+        echo -e "Daemon:      ${GREEN}✓ running${NC} (PID: $DAEMON_PID, profile: local-dev)"
+    else
+        echo -e "Daemon:      ${RED}✗ stopped${NC}"
+    fi
+    
+    echo ""
+}
+
+# Main script logic
+case "${1:-}" in
+    start)
+        start_multica
+        ;;
+    stop)
+        stop_multica
+        ;;
+    restart)
+        stop_multica
+        echo ""
+        start_multica
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo -e "${BLUE}Multica Development Environment Manager${NC}"
+        echo ""
+        echo -e "${YELLOW}Usage:${NC}"
+        echo -e "  multica-dev ${GREEN}start${NC}    - Start all services (PostgreSQL, server, daemon)"
+        echo -e "  multica-dev ${RED}stop${NC}     - Stop server and daemon (keeps PostgreSQL)"
+        echo -e "  multica-dev ${YELLOW}restart${NC}  - Restart all services"
+        echo -e "  multica-dev ${BLUE}status${NC}   - Show status of all services"
+        echo ""
+        echo -e "${BLUE}Examples:${NC}"
+        echo -e "  multica-dev start"
+        echo -e "  multica-dev status"
+        echo -e "  multica-dev stop"
+        echo ""
+        exit 1
+        ;;
+esac

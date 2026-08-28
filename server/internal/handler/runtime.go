@@ -512,12 +512,50 @@ type UpdateAgentRuntimeRequest struct {
 	// runtime per provider) instead of just this one. Ignored when the
 	// runtime has no daemon_id.
 	ApplyToMachine bool `json:"apply_to_machine,omitempty"`
+	// TierModelMap configures Cerebra tier-based routing. Maps complexity
+	// tiers (simple, standard, heavy) to model IDs. Owner / workspace admin only.
+	TierModelMap map[string]string `json:"tier_model_map,omitempty"`
+	// SemanticModelMap configures Cerebra semantic domain routing. Maps
+	// domains (code, math, creative, search, data) to model IDs. Owner / workspace admin only.
+	SemanticModelMap map[string]string `json:"semantic_model_map,omitempty"`
 }
 
 // maxRuntimeCustomNameLen caps a runtime's custom name. Default names are
 // short (e.g. "Claude (host.local)"); 100 chars is generous headroom while
 // keeping the picker rows and machine headers from overflowing.
 const maxRuntimeCustomNameLen = 100
+
+// validateTierModelMap validates that tier_model_map keys are valid tier names
+func validateTierModelMap(m map[string]string) error {
+	validTiers := map[string]bool{
+		"simple":   true,
+		"standard": true,
+		"heavy":    true,
+	}
+	for tier := range m {
+		if !validTiers[tier] {
+			return fmt.Errorf("invalid tier: %s (must be 'simple', 'standard', or 'heavy')", tier)
+		}
+	}
+	return nil
+}
+
+// validateSemanticModelMap validates that semantic_model_map keys are valid domain names
+func validateSemanticModelMap(m map[string]string) error {
+	validDomains := map[string]bool{
+		"code":     true,
+		"math":     true,
+		"creative": true,
+		"search":   true,
+		"data":     true,
+	}
+	for domain := range m {
+		if !validDomains[domain] {
+			return fmt.Errorf("invalid domain: %s (must be one of: code, math, creative, search, data)", domain)
+		}
+	}
+	return nil
+}
 
 // UpdateAgentRuntime handles PATCH /api/runtimes/:id. Currently visibility
 // is editable; the request shape is open-ended so future fields (display
@@ -582,6 +620,21 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 	if req.CustomName != nil {
 		if len([]rune(strings.TrimSpace(*req.CustomName))) > maxRuntimeCustomNameLen {
 			writeError(w, http.StatusBadRequest, "custom name is too long")
+			return
+		}
+	}
+
+	// Validate Cerebra model maps
+	if req.TierModelMap != nil {
+		if err := validateTierModelMap(req.TierModelMap); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	if req.SemanticModelMap != nil {
+		if err := validateSemanticModelMap(req.SemanticModelMap); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
@@ -651,6 +704,82 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Update Cerebra model maps
+	if req.TierModelMap != nil || req.SemanticModelMap != nil {
+		// Marshal maps to JSON for storage
+		var tierMapJSON, semanticMapJSON []byte
+		var err error
+
+		if req.TierModelMap != nil {
+			if len(req.TierModelMap) == 0 {
+				tierMapJSON = []byte("null")
+			} else {
+				tierMapJSON, err = json.Marshal(req.TierModelMap)
+				if err != nil {
+					slog.Error("failed to marshal tier_model_map", "error", err)
+					writeError(w, http.StatusInternalServerError, "failed to update runtime")
+					return
+				}
+			}
+		}
+
+		if req.SemanticModelMap != nil {
+			if len(req.SemanticModelMap) == 0 {
+				semanticMapJSON = []byte("null")
+			} else {
+				semanticMapJSON, err = json.Marshal(req.SemanticModelMap)
+				if err != nil {
+					slog.Error("failed to marshal semantic_model_map", "error", err)
+					writeError(w, http.StatusInternalServerError, "failed to update runtime")
+					return
+				}
+			}
+		}
+
+		// Update both maps or individual map
+		if req.TierModelMap != nil && req.SemanticModelMap != nil {
+			err = h.Queries.UpdateRuntimeModelMaps(r.Context(), db.UpdateRuntimeModelMapsParams{
+				ID:               runtimeUUID,
+				TierModelMap:     tierMapJSON,
+				SemanticModelMap: semanticMapJSON,
+			})
+			if err != nil {
+				slog.Error("UpdateRuntimeModelMaps failed", "error", err, "runtime_id", runtimeID)
+				writeError(w, http.StatusInternalServerError, "failed to update runtime")
+				return
+			}
+		} else if req.TierModelMap != nil {
+			err = h.Queries.UpdateRuntimeTierModelMap(r.Context(), db.UpdateRuntimeTierModelMapParams{
+				ID:           runtimeUUID,
+				TierModelMap: tierMapJSON,
+			})
+			if err != nil {
+				slog.Error("UpdateRuntimeTierModelMap failed", "error", err, "runtime_id", runtimeID)
+				writeError(w, http.StatusInternalServerError, "failed to update runtime")
+				return
+			}
+		} else if req.SemanticModelMap != nil {
+			err = h.Queries.UpdateRuntimeSemanticModelMap(r.Context(), db.UpdateRuntimeSemanticModelMapParams{
+				ID:               runtimeUUID,
+				SemanticModelMap: semanticMapJSON,
+			})
+			if err != nil {
+				slog.Error("UpdateRuntimeSemanticModelMap failed", "error", err, "runtime_id", runtimeID)
+				writeError(w, http.StatusInternalServerError, "failed to update runtime")
+				return
+			}
+		}
+
+		// Re-fetch runtime to get updated model maps
+		rt, err = h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+		if err != nil {
+			slog.Error("failed to re-fetch runtime after model map update", "error", err, "runtime_id", runtimeID)
+			writeError(w, http.StatusInternalServerError, "failed to update runtime")
+			return
+		}
+		changed = true
+	}
+
 	if changed {
 		// Notify connected clients that runtime metadata changed so the
 		// list/detail pages refresh — matches the pattern used by
@@ -661,6 +790,120 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, runtimeToResponse(rt))
+}
+
+// GetRuntimeModelMaps returns the Cerebra model routing configuration for a runtime.
+// GET /api/runtimes/:id/model-maps
+func (h *Handler) GetRuntimeModelMaps(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	if !ok {
+		return
+	}
+
+	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+
+	// Verify workspace membership
+	_, ok = h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found")
+	if !ok {
+		return
+	}
+
+	// Parse JSONB fields to maps
+	var tierModelMap, semanticModelMap map[string]string
+
+	if len(rt.TierModelMap) > 0 && string(rt.TierModelMap) != "null" {
+		if err := json.Unmarshal(rt.TierModelMap, &tierModelMap); err != nil {
+			slog.Error("failed to unmarshal tier_model_map", "error", err, "runtime_id", runtimeID)
+			writeError(w, http.StatusInternalServerError, "failed to read model maps")
+			return
+		}
+	}
+
+	if len(rt.SemanticModelMap) > 0 && string(rt.SemanticModelMap) != "null" {
+		if err := json.Unmarshal(rt.SemanticModelMap, &semanticModelMap); err != nil {
+			slog.Error("failed to unmarshal semantic_model_map", "error", err, "runtime_id", runtimeID)
+			writeError(w, http.StatusInternalServerError, "failed to read model maps")
+			return
+		}
+	}
+
+	response := map[string]interface{}{
+		"tier_model_map":     tierModelMap,
+		"semantic_model_map": semanticModelMap,
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+// MarkModelUnavailable marks a model as temporarily unavailable due to quota/rate limits.
+// POST /api/runtimes/:id/models/:model/unavailable
+func (h *Handler) MarkModelUnavailable(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	runtimeUUID, ok := parseUUIDOrBadRequest(w, runtimeID, "runtime_id")
+	if !ok {
+		return
+	}
+
+	model := chi.URLParam(r, "model")
+	if model == "" {
+		writeError(w, http.StatusBadRequest, "model parameter is required")
+		return
+	}
+
+	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+
+	// Verify workspace membership
+	_, ok = h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found")
+	if !ok {
+		return
+	}
+
+	var req struct {
+		TTLSeconds int `json:"ttl_seconds"`
+	}
+
+	// Decode request body (optional - defaults to 3600 if not provided)
+	if r.Body != nil && r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
+
+	if req.TTLSeconds <= 0 {
+		req.TTLSeconds = 3600 // Default 1 hour
+	}
+
+	// Mark model as unavailable
+	err = h.Queries.UpsertModelUnavailability(r.Context(), db.UpsertModelUnavailabilityParams{
+		RuntimeID:  runtimeUUID,
+		Model:      model,
+		MarkedAt:   pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		TtlSeconds: int32(req.TTLSeconds),
+	})
+
+	if err != nil {
+		slog.Error("UpsertModelUnavailability failed", "error", err, "runtime_id", runtimeID, "model", model)
+		writeError(w, http.StatusInternalServerError, "failed to mark model unavailable")
+		return
+	}
+
+	slog.Info("marked model unavailable",
+		"runtime_id", runtimeID,
+		"model", model,
+		"ttl_seconds", req.TTLSeconds,
+	)
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func canEditRuntime(member db.Member, rt db.AgentRuntime) bool {

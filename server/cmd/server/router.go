@@ -1344,7 +1344,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 		r.Post("/workspaces/{workspaceId}/issues/gc-check", h.BatchIssueGCCheck)
 		r.Get("/issues/{issueId}/gc-check", h.GetIssueGCCheck)
+		r.Post("/issues/{issueId}/session-model", h.SetIssueSessionModel)
+		r.Get("/issues/{issueId}/session-model", h.GetIssueSessionModel)
 		r.Get("/chat-sessions/{sessionId}/gc-check", h.GetChatSessionGCCheck)
+		r.Post("/chat-sessions/{sessionId}/session-model", h.SetChatSessionModel)
+		r.Get("/chat-sessions/{sessionId}/session-model", h.GetChatSessionModel)
 		r.Get("/autopilot-runs/{runId}/gc-check", h.GetAutopilotRunGCCheck)
 		r.Get("/tasks/{taskId}/gc-check", h.GetTaskGCCheck)
 
@@ -2043,6 +2047,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/update/{updateId}", h.GetUpdate)
 					r.Post("/models", h.InitiateListModels)
 					r.Get("/models/{requestId}", h.GetModelListRequest)
+					// Cerebra model routing configuration
+					r.Get("/model-maps", h.GetRuntimeModelMaps)
+					r.Post("/models/{model}/unavailable", h.MarkModelUnavailable)
+					r.Post("/discover-models", h.RefreshRuntimeModels)
 					r.Post("/local-skills", h.InitiateListLocalSkills)
 					r.Get("/local-skills/{requestId}", h.GetLocalSkillListRequest)
 					r.Post("/local-skills/import", h.InitiateImportLocalSkill)

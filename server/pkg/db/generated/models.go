@@ -96,6 +96,12 @@ type AgentRuntime struct {
 	Visibility     string             `json:"visibility"`
 	ProfileID      pgtype.UUID        `json:"profile_id"`
 	CustomName     pgtype.Text        `json:"custom_name"`
+	// Maps complexity tiers (simple, standard, heavy) to model IDs for dynamic routing
+	TierModelMap []byte `json:"tier_model_map"`
+	// Maps semantic domains (code, math, creative, search, data) to specialist model IDs
+	SemanticModelMap []byte `json:"semantic_model_map"`
+	// Cached list of models available from this runtime, discovered via the model list API. Format: [{"id": "gpt-4o", "name": "GPT-4o", "tier": "standard"}, ...]. NULL means discovery has not run yet.
+	DiscoveredModels []byte `json:"discovered_models"`
 }
 
 type AgentSkill struct {
@@ -308,6 +314,16 @@ type AutopilotTrigger struct {
 	PublishedByID pgtype.UUID `json:"published_by_id"`
 }
 
+// Tracks models temporarily unavailable due to quota/rate limits
+type CerebraModelUnavailability struct {
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	Model     string      `json:"model"`
+	// When the model was marked unavailable
+	MarkedAt pgtype.Timestamptz `json:"marked_at"`
+	// How long to consider the model unavailable (default 1 hour)
+	TtlSeconds int32 `json:"ttl_seconds"`
+}
+
 type ChannelBindingToken struct {
 	TokenHash      string             `json:"token_hash"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
@@ -457,6 +473,8 @@ type ChatSession struct {
 	IsAgentIntro bool               `json:"is_agent_intro"`
 	PinnedAt     pgtype.Timestamptz `json:"pinned_at"`
 	ProjectID    pgtype.UUID        `json:"project_id"`
+	// Model chosen for first turn, maintained by Cerebra session affinity
+	SessionModel pgtype.Text `json:"session_model"`
 }
 
 type ClientUsageDaily struct {
@@ -725,6 +743,8 @@ type Issue struct {
 	Properties         []byte             `json:"properties"`
 	Revision           int64              `json:"revision"`
 	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
+	// Model chosen for first turn, maintained by Cerebra session affinity
+	SessionModel pgtype.Text `json:"session_model"`
 }
 
 type IssueDependency struct {
