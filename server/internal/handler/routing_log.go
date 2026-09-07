@@ -5,11 +5,16 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/cerebra"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // GetTaskRoutingLog returns the Cerebra routing evidence for a task.
+
 // Route: GET /api/tasks/{taskId}/routing-log
 func (h *Handler) GetTaskRoutingLog(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
@@ -53,7 +58,7 @@ func (h *Handler) PutRuntimeTierModelMap(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	rt, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceRuntimeAPI, runtimeUUID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
@@ -96,4 +101,43 @@ func (h *Handler) PutRuntimeTierModelMap(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ReportTaskRoutingLog stores a routing decision record submitted by the daemon.
+// Route: POST /api/daemon/tasks/{taskId}/routing-log
+func (h *Handler) ReportTaskRoutingLog(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	if _, ok := parseUUIDOrBadRequest(w, taskID, "task_id"); !ok {
+		return
+	}
+
+	var req cerebra.RoutingLogEntry
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	id := uuid.New().String()
+	if err := h.Queries.InsertRoutingLog(r.Context(), db.InsertRoutingLogParams{
+		ID:                id,
+		TaskID:            strToText(taskID),
+		IssueID:           strToText(req.IssueID),
+		SessionID:         strToText(req.SessionID),
+		RuntimeID:         req.RuntimeID,
+		ChosenModel:       req.ChosenModel,
+		Tier:              req.Tier,
+		MatchedRule:       req.MatchedRule,
+		ToolChainExpected: req.ToolChainExpected,
+		FallbackUsed:      req.FallbackUsed,
+		LatencyMs:         int32(req.LatencyMs),
+		Status:            req.Status,
+		PolicyReason:      strToText(req.PolicyReason),
+		CandidateCount:    pgtype.Int4{Int32: int32(req.CandidateCount), Valid: req.CandidateCount > 0},
+		ClassifierVersion: strToText(req.ClassifierVersion),
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to insert routing log")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id})
 }
