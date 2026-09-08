@@ -7428,6 +7428,21 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		thinkingLevel = task.Agent.ThinkingLevel
 		serviceTier = task.Agent.ServiceTier
 	}
+          
+        
+
+    	// Smart model routing: auto-select best model based on query complexity.
+      	  {
+       	    routedModel, routingDecision := RouteModel(
+            	prompt, provider, model,
+            	DefaultSmartRouterConfig(), taskLog,
+       	    )
+       	    if routingDecision.Routed {
+           	 model = routedModel
+            }
+            _ = routingDecision
+   	}         
+               
 	selection := resolveTaskModelSelection(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs),
 		taskModelSelection{Model: model, ThinkingLevel: thinkingLevel, ServiceTier: serviceTier}, taskLog)
 	model, thinkingLevel, serviceTier = selection.Model, selection.ThinkingLevel, selection.ServiceTier
