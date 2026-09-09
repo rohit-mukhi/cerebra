@@ -1441,3 +1441,32 @@ type WorkspaceShareLink struct {
 	IsActive    bool               `json:"is_active"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
+
+type CerebraModelUnavailability struct {
+	RuntimeID  string             `json:"runtime_id"`
+	Model      string             `json:"model"`
+	MarkedAt   pgtype.Timestamptz `json:"marked_at"`
+	TtlSeconds int32              `json:"ttl_seconds"`
+}
+
+type CerebraRoutingLog struct {
+	ID                string             `json:"id"`
+	TaskID            pgtype.Text        `json:"task_id"`
+	IssueID           pgtype.Text        `json:"issue_id"`
+	SessionID         pgtype.Text        `json:"session_id"`
+	RuntimeID         string             `json:"runtime_id"`
+	ChosenModel       string             `json:"chosen_model"`
+	Tier              string             `json:"tier"`
+	MatchedRule       string             `json:"matched_rule"`
+	ToolChainExpected bool               `json:"tool_chain_expected"`
+	FallbackUsed      bool               `json:"fallback_used"`
+	LatencyMs         int32              `json:"latency_ms"`
+	Status            string             `json:"status"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	PolicyReason      pgtype.Text        `json:"policy_reason"`
+	CandidateCount    pgtype.Int4        `json:"candidate_count"`
+	ClassifierVersion pgtype.Text        `json:"classifier_version"`
+	EstimatedCost     pgtype.Numeric     `json:"estimated_cost"`
+	InputTokens       pgtype.Int4        `json:"input_tokens"`
+	OutputTokens      pgtype.Int4        `json:"output_tokens"`
+}

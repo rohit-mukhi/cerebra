@@ -29,6 +29,7 @@ jobs:
       frontend: ${{ steps.decide.outputs.frontend }}
       backend: ${{ steps.decide.outputs.backend }}
       sqlc: ${{ steps.decide.outputs.sqlc }}
+      cerebra: ${{ steps.decide.outputs.cerebra }}
       images: ${{ steps.filter.outputs.images }}
     steps:
       - name: Checkout
@@ -109,6 +110,13 @@ jobs:
               - 'scripts/makefile-build.test.sh'
               - 'Makefile'
               - '.github/workflows/ci.yml'
+            cerebra:
+              - 'plugins/cerebra/**'
+              - 'server/internal/cerebra/**'
+              - 'server/internal/daemon/**'
+              - 'test_cerebra_e2e.sh'
+              - 'Makefile'
+              - '.github/workflows/ci.yml'
             sqlc:
               - 'server/pkg/db/queries/**'
               - 'server/pkg/db/generated/**'
@@ -146,21 +154,30 @@ jobs:
           FRONTEND_CHANGED: ${{ steps.filter.outputs.frontend }}
           BACKEND_CHANGED: ${{ steps.filter.outputs.backend }}
           SQLC_CHANGED: ${{ steps.filter.outputs.sqlc }}
+          CEREBRA_CHANGED: ${{ steps.filter.outputs.cerebra }}
         run: |
           if [ "$EVENT_NAME" != "pull_request" ] || [ "$FRONTEND_CHANGED" = "true" ]; then
             echo "frontend=true" >> "$GITHUB_OUTPUT"
           else
             echo "frontend=false" >> "$GITHUB_OUTPUT"
           fi
+
           if [ "$EVENT_NAME" != "pull_request" ] || [ "$BACKEND_CHANGED" = "true" ]; then
             echo "backend=true" >> "$GITHUB_OUTPUT"
           else
             echo "backend=false" >> "$GITHUB_OUTPUT"
           fi
+
           if [ "$EVENT_NAME" != "pull_request" ] || [ "$SQLC_CHANGED" = "true" ]; then
             echo "sqlc=true" >> "$GITHUB_OUTPUT"
           else
             echo "sqlc=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$CEREBRA_CHANGED" = "true" ]; then
+            echo "cerebra=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cerebra=false" >> "$GITHUB_OUTPUT"
           fi
 
   sqlc-check:
@@ -574,6 +591,61 @@ jobs:
             exit 1
           fi
 
+  cerebra-e2e:
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        if: ${{ needs.changes.outputs.cerebra == 'true' }}
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        if: ${{ needs.changes.outputs.cerebra == 'true' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache-dependency-path: server/go.sum
+
+      - name: Build Multica CLI for Cerebra E2E
+        if: ${{ needs.changes.outputs.cerebra == 'true' }}
+        run: |
+          mkdir -p bin
+          cd server
+          go build \
+            -ldflags "-X main.version=ci -X main.commit=${GITHUB_SHA}" \
+            -o ../bin/multica \
+            ./cmd/multica
+          chmod +x ../bin/multica
+          ../bin/multica version
+
+      - name: Run Cerebra E2E suite
+        if: ${{ needs.changes.outputs.cerebra == 'true' }}
+        run: bash ./test_cerebra_e2e.sh
+
+      - name: Upload Cerebra E2E logs
+        if: ${{ always() && needs.changes.outputs.cerebra == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cerebra-e2e-logs
+          path: test_logs/
+          if-no-files-found: ignore
+  cerebra:
+    needs: [cerebra-e2e]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Cerebra E2E result
+        env:
+          CEREBRA_RESULT: ${{ needs.cerebra-e2e.result }}
+        run: |
+          echo "cerebra-e2e: $CEREBRA_RESULT"
+          if [ "$CEREBRA_RESULT" != "success" ]; then
+            echo "::error::Cerebra validation failed"
+            exit 1
+          fi
   windows-execenv:
     # The environment-preparation deadline owns a process tree, not just a Go
     # process. This Windows runtime test verifies Job Object cancellation kills

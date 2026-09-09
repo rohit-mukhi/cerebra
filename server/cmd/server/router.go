@@ -1792,6 +1792,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 			// Task messages (user-facing, not daemon auth)
 			r.Get("/api/tasks/{taskId}/messages", h.ListTaskMessagesByUser)
+			r.Get("/api/tasks/{taskId}/routing-log", h.GetTaskRoutingLog)
 
 			// Issue quick actions (definitions; running one lives under
 			// /api/issues/{id}/quick-actions/{quickActionId}/run)
@@ -2060,6 +2061,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// archive-and-delete contract (MUL-5559 renamed the
 					// behaviour, not just the route). Same handler.
 					r.Post("/archive-agents-and-delete", h.UnbindAgentsAndDeleteRuntime)
+					r.Put("/tier-model-map", h.PutRuntimeTierModelMap)
 				})
 			})
 
