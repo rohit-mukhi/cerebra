@@ -90,6 +90,15 @@ type RoutingDecision struct {
 	Routed bool
 }
 
+// RoutingHeuristics holds team-level keyword overrides and custom weights
+// that are applied on top of the built-in scoring signals.
+type RoutingHeuristics struct {
+	// Keywords maps a lowercase keyword to a score delta.
+	// Positive values push toward Advanced; negative toward Lightweight.
+	// Example: map[string]int{"hotfix": -1, "platform redesign": 3}
+	Keywords map[string]int
+}
+
 // SmartRouterConfig controls which tasks the router acts on and what models
 // it selects. Set Enabled=false to disable routing entirely (all tasks use
 // whatever model the agent has configured).
@@ -103,6 +112,8 @@ type SmartRouterConfig struct {
 	// Set to false to allow the router to OVERRIDE an existing model choice.
 	// Default: true (router only acts when model is empty or "auto").
 	OnlyWhenModelEmpty bool
+	// Heuristics holds optional team-level keyword overrides.
+	Heuristics RoutingHeuristics
 }
 
 // DefaultSmartRouterConfig returns a SmartRouterConfig with sensible defaults.
@@ -161,7 +172,7 @@ func RouteModel(
 	decision.Category = category
 
 	// Step 2: Score complexity.
-	tier := scoreComplexity(prompt, category)
+	tier := scoreComplexity(prompt, category, cfg.Heuristics)
 	decision.Tier = tier
 
 	// Step 3: Policy engine — look up the model for this tier.
@@ -251,9 +262,35 @@ func classifyTask(prompt string) TaskCategory {
 	return CategoryOther
 }
 
+// isDiffPrompt reports whether the prompt is primarily a unified diff.
+func isDiffPrompt(prompt string) bool {
+	for _, line := range strings.SplitN(prompt, "\n", 10) {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "---") || strings.HasPrefix(trimmed, "+++") || strings.HasPrefix(trimmed, "@@") {
+			return true
+		}
+	}
+	return false
+}
+
+// diffDescriptionWords counts words only in non-diff lines (the human
+// description surrounding the patch), avoiding over-tiering on large diffs.
+func diffDescriptionWords(prompt string) int {
+	var sb strings.Builder
+	for _, line := range strings.Split(prompt, "\n") {
+		if !strings.HasPrefix(line, "---") && !strings.HasPrefix(line, "+++") &&
+			!strings.HasPrefix(line, "@@") && !strings.HasPrefix(line, "+") &&
+			!strings.HasPrefix(line, "-") {
+			sb.WriteString(line)
+			sb.WriteByte(' ')
+		}
+	}
+	return countWords(sb.String())
+}
+
 // scoreComplexity assigns a complexity tier to the prompt based on
 // lexical signals and structural features.
-func scoreComplexity(prompt string, category TaskCategory) ComplexityTier {
+func scoreComplexity(prompt string, category TaskCategory, h RoutingHeuristics) ComplexityTier {
 	lower := strings.ToLower(prompt)
 	score := 0
 
@@ -296,10 +333,23 @@ func scoreComplexity(prompt string, category TaskCategory) ComplexityTier {
 		}
 	}
 
+	// ── Custom team-level keywords ─────────────────────────────────────────
+	for kw, delta := range h.Keywords {
+		if strings.Contains(lower, strings.ToLower(kw)) {
+			score += delta
+		}
+	}
+
 	// ── Structural signals ─────────────────────────────────────────────────
 
-	// Long prompts tend to be more complex.
-	wordCount := countWords(prompt)
+	// For diff prompts, measure only the description text to avoid
+	// over-tiering on large but simple patches.
+	var wordCount int
+	if isDiffPrompt(prompt) {
+		wordCount = diffDescriptionWords(prompt)
+	} else {
+		wordCount = countWords(prompt)
+	}
 	switch {
 	case wordCount > 200:
 		score += 3
