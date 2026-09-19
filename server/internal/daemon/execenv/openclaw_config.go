@@ -198,6 +198,11 @@ type OpenclawConfigPrep struct {
 	// — which is the right default when the user already has a working
 	// gateway set up locally. See issue #3260.
 	Gateway OpenclawGatewayPin
+	// Model is the Cerebra-routed model name (e.g., "groq/llama-3.3-70b-versatile")
+	// that should override the agent's default model in the per-task config.
+	// Empty means inherit the user's global model from openclaw.json.
+	// This enables dynamic model routing from Cerebra without reconfiguring agents.
+	Model string
 	// Logger records the config-discovery outcome. Optional; nil disables
 	// logging. Discovery used to be entirely silent, which is why #6630 —
 	// a wrapper written without `$include` — could only be diagnosed by
@@ -395,7 +400,7 @@ func prepareOpenclawConfig(envRoot, workDir string, opts OpenclawConfigPrep) (Op
 		}
 	}
 
-	cfg := buildPerTaskOpenclawConfig(activePath, exists, snapshotPath, resolvedList, agentsFromRegistry, workDir, managedMcp, hasManagedMcp, opts.Gateway)
+	cfg := buildPerTaskOpenclawConfig(activePath, exists, snapshotPath, resolvedList, agentsFromRegistry, workDir, managedMcp, hasManagedMcp, opts.Gateway, opts.Model)
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -512,9 +517,19 @@ func discoverOpenclawConfig(bin string, timeout time.Duration, opts OpenclawConf
 // snapshot $include has already dropped the user's `mcp` block, the
 // resulting view of `mcp.servers` is exactly the managed set — including
 // `{}` for "admin saved no servers" (mirrors `hasManagedCodexMcpConfig`).
-func buildPerTaskOpenclawConfig(activePath string, exists bool, snapshotPath string, resolvedList []any, agentsFromRegistry bool, workDir string, managedMcp map[string]any, hasManagedMcp bool, gateway OpenclawGatewayPin) map[string]any {
+func buildPerTaskOpenclawConfig(activePath string, exists bool, snapshotPath string, resolvedList []any, agentsFromRegistry bool, workDir string, managedMcp map[string]any, hasManagedMcp bool, gateway OpenclawGatewayPin, routedModel string) map[string]any {
+	defaults := map[string]any{"workspace": workDir}
+
+	// Add Cerebra-routed model override if provided
+	// This allows dynamic model routing without reconfiguring agents in ~/.openclaw/openclaw.json
+	if routedModel != "" {
+		defaults["model"] = map[string]any{
+			"primary": routedModel,
+		}
+	}
+
 	agents := map[string]any{
-		"defaults": map[string]any{"workspace": workDir},
+		"defaults": defaults,
 	}
 	// Only write per-agent overrides back to the wrapper when they came from
 	// the config-schema `agents.list` path (pre-2026.6). A registry-sourced
@@ -1301,4 +1316,53 @@ func isOpenclawUnknownSubcommand(err error) bool {
 		strings.Contains(msg, "unknown option") ||
 		strings.Contains(msg, "does not recognize") ||
 		strings.Contains(msg, "unknown argument")
+}
+
+// UpdateOpenClawConfigModel updates the model in an existing OpenClaw config file.
+// This allows dynamic model routing (Cerebra) to override the model after environment
+// preparation but before agent execution.
+func UpdateOpenClawConfigModel(configPath string, model string) error {
+	if configPath == "" || model == "" {
+		return nil // Nothing to update
+	}
+
+	// Read existing config
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read openclaw config: %w", err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse openclaw config: %w", err)
+	}
+
+	// Update agents.defaults.model.primary
+	agents, ok := cfg["agents"].(map[string]any)
+	if !ok {
+		agents = map[string]any{}
+		cfg["agents"] = agents
+	}
+
+	defaults, ok := agents["defaults"].(map[string]any)
+	if !ok {
+		defaults = map[string]any{}
+		agents["defaults"] = defaults
+	}
+
+	defaults["model"] = map[string]any{
+		"primary": model,
+	}
+
+	// Write updated config
+	updatedData, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal updated config: %w", err)
+	}
+
+	if err := os.WriteFile(configPath, updatedData, 0o600); err != nil {
+		return fmt.Errorf("write updated config: %w", err)
+	}
+
+	return nil
 }

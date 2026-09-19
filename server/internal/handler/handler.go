@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/cerebra"
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/entitlement"
@@ -312,6 +313,12 @@ type Handler struct {
 	// production, which gets the real handshake probe; tests inject a fake so
 	// the install path runs without a socket.
 	WecomCredentialProbe wecom.CredentialProbe
+
+	// CerebraRouter performs dynamic model selection based on prompt complexity,
+	// semantic routing, and session affinity. Nil-safe: when nil or routing
+	// fails, the handler falls back to agent.model (static model selection).
+	// Wired in cmd/server/router.go during Handler construction.
+	CerebraRouter *cerebra.Router
 
 	// TelegramInstall owns the Telegram bot install lifecycle (register a
 	// pasted BotFather token / list / revoke) and the at-rest encryption of

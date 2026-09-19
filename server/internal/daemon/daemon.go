@@ -7399,120 +7399,159 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		model = entry.Model
 	}
 
-	// Cerebra dynamic model routing: override model based on task complexity/domain
-	// Phase 5: Check for existing session affinity first, then route if needed
-	if task.RuntimeID != "" && d.client != nil {
-		// Step 1: Check for existing session model (session affinity)
-		var sessionModel string
-		var sessionTier cerebra.Tier
-		if task.IssueID != "" {
-			if sm, err := d.client.GetIssueSessionModel(ctx, task.IssueID); err != nil {
-				taskLog.Warn("cerebra: failed to get issue session model", "error", err)
-			} else if sm != "" {
-				sessionModel = sm
-				sessionTier = cerebra.InferTierFromModel(sm)
-				taskLog.Debug("cerebra: found existing issue session model",
-					"session_model", sessionModel,
-					"session_tier", sessionTier,
-				)
-			}
-		} else if task.ChatSessionID != "" {
-			if sm, err := d.client.GetChatSessionModel(ctx, task.ChatSessionID); err != nil {
-				taskLog.Warn("cerebra: failed to get chat session model", "error", err)
-			} else if sm != "" {
-				sessionModel = sm
-				sessionTier = cerebra.InferTierFromModel(sm)
-				taskLog.Debug("cerebra: found existing chat session model",
-					"session_model", sessionModel,
-					"session_tier", sessionTier,
-				)
-			}
+	// For OpenClaw provider, save the original agent model (which should be the OpenClaw agent ID)
+	// CerebraModel will contain the server-routed LLM model if Cerebra routing was applied
+	var openclawAgentID string
+	var cerebraRoutedModel string
+	if provider == "openclaw" {
+		openclawAgentID = model // This should be the agent ID from database (e.g., "nova")
+		// If server provided a Cerebra-routed model, use it; otherwise use agent model
+		if task.Agent != nil && task.Agent.CerebraModel != "" {
+			cerebraRoutedModel = task.Agent.CerebraModel
+		} else {
+			cerebraRoutedModel = model
 		}
-
-		// Step 2: Fetch model maps for routing decision
-		tierModelMap, semanticModelMap, err := d.client.GetRuntimeModelMaps(ctx, task.RuntimeID)
-		if err != nil {
-			// Non-fatal: log and continue with original model selection
-			taskLog.Warn("cerebra: failed to fetch model maps; continuing with static model", "error", err)
-		} else if len(tierModelMap) > 0 || len(semanticModelMap) > 0 {
-			// Extract prompt for routing
-			prompt := buildRoutingPrompt(task)
-			if prompt != "" {
-				// Determine the tier of the current prompt
-				scorer := cerebra.NewScorer()
-				promptTier := scorer.Score(prompt)
-
-				// Step 3: Apply session affinity with escalation logic
-				if sessionModel != "" {
-					// Compare prompt tier vs session tier
-					comparison := cerebra.CompareTiers(promptTier, sessionTier)
-					if comparison > 0 {
-						// Escalation needed: prompt tier > session tier
-						taskLog.Info("cerebra: escalating from session model (higher complexity detected)",
-							"session_model", sessionModel,
-							"session_tier", sessionTier,
-							"prompt_tier", promptTier,
-						)
-						// Continue with routing to get stronger model
-					} else {
-						// Reuse session model (affinity holds, no de-escalation)
-						taskLog.Info("cerebra: reusing session model (affinity)",
-							"session_model", sessionModel,
-							"session_tier", sessionTier,
-							"prompt_tier", promptTier,
-						)
-						model = sessionModel
-						// Skip routing entirely - affinity takes precedence
-						goto skipRouting
-					}
-				}
-
-				// Step 4: Perform routing (first turn OR escalation needed)
-				// Try semantic routing first (priority)
-				if len(semanticModelMap) > 0 {
-					semanticRouter := cerebra.NewSemanticRouter(semanticModelMap)
-					if match := semanticRouter.Match(prompt); match != nil && match.Model != "" {
-						taskLog.Info("cerebra: semantic routing selected model",
-							"original_model", model,
-							"routed_model", match.Model,
-							"domain", match.Domain,
-							"confidence", match.Confidence,
-						)
-						model = match.Model
-					}
-				}
-
-				// Fallback to tier routing if semantic didn't match
-				if model == entry.Model && len(tierModelMap) > 0 {
-					if tierModel, exists := tierModelMap[string(promptTier)]; exists {
-						taskLog.Info("cerebra: tier routing selected model",
-							"original_model", model,
-							"routed_model", tierModel,
-							"tier", promptTier,
-						)
-						model = tierModel
-					}
-				}
-
-			skipRouting:
-				// Step 5: Update session model for future turns
-				// (only for issue/chat tasks, only if model was determined)
-				if task.IssueID != "" {
-					if err := d.client.SetIssueSessionModel(ctx, task.IssueID, model); err != nil {
-						taskLog.Warn("cerebra: failed to update issue session model; session affinity may not work", "error", err)
-					} else {
-						taskLog.Debug("cerebra: updated issue session model", "issue_id", task.IssueID, "model", model)
-					}
-				} else if task.ChatSessionID != "" {
-					if err := d.client.SetChatSessionModel(ctx, task.ChatSessionID, model); err != nil {
-						taskLog.Warn("cerebra: failed to update chat session model; session affinity may not work", "error", err)
-					} else {
-						taskLog.Debug("cerebra: updated chat session model", "session_id", task.ChatSessionID, "model", model)
-					}
-				}
-			}
-		}
+		taskLog.Debug("openclaw agent routing",
+			"agent_id", openclawAgentID,
+			"cerebra_model", cerebraRoutedModel,
+			"server_provided", task.Agent != nil && task.Agent.CerebraModel != "",
+		)
 	}
+
+	// Cerebra dynamic model routing and session affinity
+	if task.RuntimeID != "" && d.client != nil {
+		// If server already routed (provided CerebraModel), just update session model
+		if task.Agent != nil && task.Agent.CerebraModel != "" {
+			// Server provided routed model, update session affinity
+			if task.IssueID != "" {
+				if err := d.client.SetIssueSessionModel(ctx, task.IssueID, task.Agent.CerebraModel); err != nil {
+					taskLog.Warn("cerebra: failed to update issue session model", "error", err)
+				} else {
+					taskLog.Debug("cerebra: updated issue session model from server routing",
+						"model", task.Agent.CerebraModel)
+				}
+			} else if task.ChatSessionID != "" {
+				if err := d.client.SetChatSessionModel(ctx, task.ChatSessionID, task.Agent.CerebraModel); err != nil {
+					taskLog.Warn("cerebra: failed to update chat session model", "error", err)
+				} else {
+					taskLog.Debug("cerebra: updated chat session model from server routing",
+						"model", task.Agent.CerebraModel)
+				}
+			}
+		} else {
+			// Server didn't route, do daemon-side routing (legacy path)
+			// Step 1: Check for existing session model (session affinity)
+			var sessionModel string
+			var sessionTier cerebra.Tier
+			if task.IssueID != "" {
+				if sm, err := d.client.GetIssueSessionModel(ctx, task.IssueID); err != nil {
+					taskLog.Warn("cerebra: failed to get issue session model", "error", err)
+				} else if sm != "" {
+					sessionModel = sm
+					sessionTier = cerebra.InferTierFromModel(sm)
+					taskLog.Debug("cerebra: found existing issue session model",
+						"session_model", sessionModel,
+						"session_tier", sessionTier,
+					)
+				}
+			} else if task.ChatSessionID != "" {
+				if sm, err := d.client.GetChatSessionModel(ctx, task.ChatSessionID); err != nil {
+					taskLog.Warn("cerebra: failed to get chat session model", "error", err)
+				} else if sm != "" {
+					sessionModel = sm
+					sessionTier = cerebra.InferTierFromModel(sm)
+					taskLog.Debug("cerebra: found existing chat session model",
+						"session_model", sessionModel,
+						"session_tier", sessionTier,
+					)
+				}
+			}
+
+			// Step 2: Fetch model maps for routing decision
+			tierModelMap, semanticModelMap, err := d.client.GetRuntimeModelMaps(ctx, task.RuntimeID)
+			if err != nil {
+				// Non-fatal: log and continue with original model selection
+				taskLog.Warn("cerebra: failed to fetch model maps; continuing with static model", "error", err)
+			} else if len(tierModelMap) > 0 || len(semanticModelMap) > 0 {
+				// Extract prompt for routing
+				prompt := buildRoutingPrompt(task)
+				if prompt != "" {
+					// Determine the tier of the current prompt
+					scorer := cerebra.NewScorer()
+					promptTier := scorer.Score(prompt)
+
+					// Step 3: Apply session affinity with escalation logic
+					if sessionModel != "" {
+						// Compare prompt tier vs session tier
+						comparison := cerebra.CompareTiers(promptTier, sessionTier)
+						if comparison > 0 {
+							// Escalation needed: prompt tier > session tier
+							taskLog.Info("cerebra: escalating from session model (higher complexity detected)",
+								"session_model", sessionModel,
+								"session_tier", sessionTier,
+								"prompt_tier", promptTier,
+							)
+							// Continue with routing to get stronger model
+						} else {
+							// Reuse session model (affinity holds, no de-escalation)
+							taskLog.Info("cerebra: reusing session model (affinity)",
+								"session_model", sessionModel,
+								"session_tier", sessionTier,
+								"prompt_tier", promptTier,
+							)
+							model = sessionModel
+							// Skip routing entirely - affinity takes precedence
+							goto skipRouting
+						}
+					}
+
+					// Step 4: Perform routing (first turn OR escalation needed)
+					// Try semantic routing first (priority)
+					if len(semanticModelMap) > 0 {
+						semanticRouter := cerebra.NewSemanticRouter(semanticModelMap)
+						if match := semanticRouter.Match(prompt); match != nil && match.Model != "" {
+							taskLog.Info("cerebra: semantic routing selected model",
+								"original_model", model,
+								"routed_model", match.Model,
+								"domain", match.Domain,
+								"confidence", match.Confidence,
+							)
+							model = match.Model
+						}
+					}
+
+					// Fallback to tier routing if semantic didn't match
+					if model == entry.Model && len(tierModelMap) > 0 {
+						if tierModel, exists := tierModelMap[string(promptTier)]; exists {
+							taskLog.Info("cerebra: tier routing selected model",
+								"original_model", model,
+								"routed_model", tierModel,
+								"tier", promptTier,
+							)
+							model = tierModel
+						}
+					}
+
+				skipRouting:
+					// Step 5: Update session model for future turns
+					// (only for issue/chat tasks, only if model was determined)
+					if task.IssueID != "" {
+						if err := d.client.SetIssueSessionModel(ctx, task.IssueID, model); err != nil {
+							taskLog.Warn("cerebra: failed to update issue session model; session affinity may not work", "error", err)
+						} else {
+							taskLog.Debug("cerebra: updated issue session model", "issue_id", task.IssueID, "model", model)
+						}
+					} else if task.ChatSessionID != "" {
+						if err := d.client.SetChatSessionModel(ctx, task.ChatSessionID, model); err != nil {
+							taskLog.Warn("cerebra: failed to update chat session model; session affinity may not work", "error", err)
+						} else {
+							taskLog.Debug("cerebra: updated chat session model", "session_id", task.ChatSessionID, "model", model)
+						}
+					}
+				}
+			}
+		} // end else (daemon-side routing)
+	} // end if (Cerebra enabled)
 
 	taskLog.Info("starting agent",
 		"provider", provider,
@@ -7552,6 +7591,40 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	selection := resolveTaskModelSelection(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs),
 		taskModelSelection{Model: model, ThinkingLevel: thinkingLevel, ServiceTier: serviceTier}, taskLog)
 	model, thinkingLevel, serviceTier = selection.Model, selection.ThinkingLevel, selection.ServiceTier
+
+	// Update OpenClaw config with Cerebra-routed model
+	// For OpenClaw with Cerebra routing:
+	// 1. Pass the agent ID (e.g., "nova") to --agent flag
+	// 2. Override the model in per-task config with Cerebra-routed model
+	// 3. OpenClaw uses the config model, not the agent's default model
+	if provider == "openclaw" && openclawAgentID != "" && cerebraRoutedModel != "" {
+		// Log the routing for debugging
+		taskLog.Info("openclaw cerebra dynamic routing",
+			"agent_id_for_cli", openclawAgentID,
+			"cerebra_routed_model", cerebraRoutedModel,
+		)
+
+		// Write the Cerebra-routed model to the per-task config
+		// This overrides the agent's default model from ~/.openclaw/openclaw.json
+		if env.OpenclawConfigPath != "" {
+			if err := execenv.UpdateOpenClawConfigModel(env.OpenclawConfigPath, cerebraRoutedModel); err != nil {
+				taskLog.Warn("failed to update openclaw config with routed model",
+					"error", err,
+					"routed_model", cerebraRoutedModel,
+				)
+			} else {
+				taskLog.Info("updated openclaw config with cerebra-routed model",
+					"agent_id", openclawAgentID,
+					"routed_model", cerebraRoutedModel,
+					"config_path", env.OpenclawConfigPath,
+				)
+			}
+		}
+
+		// Use the agent ID for --agent flag (e.g., "nova")
+		// NOT the LLM model name - OpenClaw will read the actual model from config
+		model = openclawAgentID
+	}
 
 	var idleWatchdogTimeout time.Duration
 	if provider == "opencode" {

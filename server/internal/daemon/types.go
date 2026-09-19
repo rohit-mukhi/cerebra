@@ -220,6 +220,7 @@ type AgentData struct {
 	CustomArgs            []string                   `json:"custom_args,omitempty"`
 	McpConfig             json.RawMessage            `json:"mcp_config,omitempty"`
 	Model                 string                     `json:"model,omitempty"`
+	CerebraModel          string                     `json:"cerebra_model,omitempty"` // Cerebra-routed LLM model (if different from Model)
 	ThinkingLevel         string                     `json:"thinking_level,omitempty"`
 	ServiceTier           string                     `json:"service_tier,omitempty"`
 	DisabledRuntimeSkills []DisabledRuntimeSkillData `json:"disabled_runtime_skills,omitempty"`

@@ -3,12 +3,16 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/multica-ai/multica/server/internal/cerebra"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -536,6 +540,15 @@ func (h *Handler) ReportModelListResult(w http.ResponseWriter, r *http.Request) 
 					"runtime_id", runtimeID, "count", len(body.Models))
 			}
 		}
+
+		// Cerebra: Auto-sync discovered models to tier_model_map for runtime-agnostic routing
+		// This enables automatic model tier assignment without manual configuration
+		if !body.Fallback && len(body.Models) > 0 {
+			if err := h.syncDiscoveredModelsToTierMap(r.Context(), runtimeID, body.Models); err != nil {
+				// Non-fatal: Cerebra routing will fall back to manual tier_model_map if this fails
+				slog.Warn("cerebra: failed to auto-sync discovered models", "error", err, "runtime_id", runtimeID)
+			}
+		}
 	} else {
 		if err := h.ModelListStore.Fail(r.Context(), requestID, body.Error); err != nil {
 			slog.Error("ModelListStore Fail failed", "error", err, "request_id", requestID)
@@ -546,4 +559,98 @@ func (h *Handler) ReportModelListResult(w http.ResponseWriter, r *http.Request) 
 
 	slog.Debug("model list report", "runtime_id", runtimeID, "request_id", requestID, "status", body.Status, "count", len(body.Models))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// syncDiscoveredModelsToTierMap converts discovered models to Cerebra DiscoveredModels
+// and syncs them to the agent_runtime.discovered_models and tier_model_map fields.
+//
+// This enables runtime-agnostic Cerebra routing: models are automatically classified
+// into tiers (simple/standard/heavy) based on parameter counts and keywords, with
+// no manual configuration required.
+//
+// Process:
+// 1. Convert ModelEntry (handler format) → DiscoveredModel (Cerebra format)
+// 2. Infer tier for each model using InferTierFromModelName (parameter-based + keywords)
+// 3. Build optimal tier_model_map (best model per tier)
+// 4. Update agent_runtime with discovered models and tier map
+func (h *Handler) syncDiscoveredModelsToTierMap(ctx context.Context, runtimeID string, models []ModelEntry) error {
+	// Convert string to google/uuid.UUID (required by Cerebra)
+	runtimeUUID, err := uuid.Parse(runtimeID)
+	if err != nil {
+		return fmt.Errorf("invalid runtime UUID: %w", err)
+	}
+
+	// Convert handler ModelEntry → Cerebra DiscoveredModel
+	discoveredModels := make([]cerebra.DiscoveredModel, 0, len(models))
+	for _, model := range models {
+		// Extract provider from model ID (e.g., "groq/llama-3.3-70b-versatile" → "groq")
+		provider := model.Provider
+		if provider == "" && model.ID != "" {
+			// Fallback: try to extract from ID
+			parts := strings.SplitN(model.ID, "/", 2)
+			if len(parts) >= 1 {
+				provider = parts[0]
+			}
+		}
+
+		discoveredModels = append(discoveredModels, cerebra.DiscoveredModel{
+			ID:           model.ID,
+			Name:         model.Label,
+			Provider:     provider,
+			InferredTier: cerebra.InferTierFromModelName(model.ID),
+			ModelType:    inferModelType(model.ID, model.Default),
+			CostTier:     inferCostTier(model.ID),
+		})
+	}
+
+	// Use Cerebra ModelDiscovery to sync to database
+	discovery := cerebra.NewModelDiscovery(h.Queries)
+	count, err := discovery.DiscoverAndAssignTiers(ctx, runtimeUUID, discoveredModels)
+	if err != nil {
+		return fmt.Errorf("cerebra discovery failed: %w", err)
+	}
+
+	slog.Info("cerebra: auto-synced discovered models to tier_model_map",
+		"runtime_id", runtimeID,
+		"models_discovered", count,
+	)
+
+	return nil
+}
+
+// inferModelType determines if a model is "primary", "fallback", or "agent"
+// based on its characteristics
+func inferModelType(modelID string, isDefault bool) string {
+	if isDefault {
+		return "primary"
+	}
+	// For most runtimes, models are neither primary nor fallback
+	// (OpenClaw-specific concepts don't apply to Hermes/OpenCode/etc)
+	return "agent"
+}
+
+// inferCostTier classifies a model into free, paid, or premium cost tiers
+func inferCostTier(modelID string) string {
+	lower := strings.ToLower(modelID)
+
+	// Free tier patterns
+	if strings.Contains(lower, "free") ||
+		strings.Contains(lower, "8b") ||
+		strings.Contains(lower, "instant") ||
+		strings.Contains(lower, "mini") ||
+		strings.Contains(lower, "haiku") {
+		return "free"
+	}
+
+	// Premium tier patterns
+	if strings.Contains(lower, "70b") ||
+		strings.Contains(lower, "opus") ||
+		strings.Contains(lower, "o1") ||
+		strings.Contains(lower, "o3") ||
+		strings.Contains(lower, "ultra") {
+		return "premium"
+	}
+
+	// Default to paid tier
+	return "paid"
 }

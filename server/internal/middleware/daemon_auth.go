@@ -103,6 +103,24 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 				return
 			}
 
+			// Dev mode bypass: accept a special dev token when MULTICA_DEV_MODE=true
+			if devUserID := auth.ValidateDevToken(tokenString); devUserID != "" {
+				r.Header.Set("X-User-ID", devUserID)
+				// For daemon auth, we need workspace context. In dev mode,
+				// we'll set a dev workspace ID and daemon ID from the token if present.
+				if devWorkspaceID := auth.DevWorkspaceID(); devWorkspaceID != "" {
+					devDaemonID := auth.DevDaemonID()
+					ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, devWorkspaceID)
+					ctx = context.WithValue(ctx, ctxKeyDaemonID, devDaemonID)
+					ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, "dev_token")
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+				// No workspace ID in dev mode, just pass the user ID
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			// Daemon token: "mdt_" prefix.
 			if strings.HasPrefix(tokenString, "mdt_") {
 				hash := auth.HashToken(tokenString)

@@ -71,6 +71,11 @@ type PrepareParams struct {
 	// runtime_config selected gateway mode (issue #3260). Zero means "inherit
 	// whatever the user's global openclaw.json already configures".
 	OpenclawGateway OpenclawGatewayPin
+	// Model is the Cerebra-routed model name (e.g., "groq/llama-3.3-70b-versatile")
+	// passed to the provider. For OpenClaw, this overrides agents.defaults.model.primary
+	// in the per-task config, enabling dynamic routing without reconfiguring ~/.openclaw/openclaw.json.
+	// Empty means use the agent's default model.
+	Model string
 	// LocalWorkDir, when non-empty, redirects the agent's working directory
 	// to a user-supplied absolute path instead of the synthesised envRoot/
 	// workdir. The path is NOT copied or mounted — the agent operates on
@@ -668,6 +673,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 			CacheDir:    openclawProfileCacheDir(params.Profile, logger),
 			McpConfig:   params.McpConfig,
 			Gateway:     params.OpenclawGateway,
+			Model:       params.Model,
 			Logger:      logger,
 		})
 		if err != nil {
@@ -713,6 +719,9 @@ type ReuseParams struct {
 	// OpenclawGateway is the per-task Gateway pin re-applied on reuse so the
 	// agent picks up any runtime_config changes saved since the prior run.
 	OpenclawGateway OpenclawGatewayPin
+	// Model is the Cerebra-routed model name re-applied on reuse so dynamic
+	// routing picks up the current model for this session/task.
+	Model string
 	// Profile is the daemon's profile name (empty = default), mirroring
 	// PrepareParams.Profile so a reused task keys its per-issue Codex session
 	// store into the same profile namespace (MUL-4424).
@@ -949,6 +958,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 			CacheDir:    openclawProfileCacheDir(params.Profile, logger),
 			McpConfig:   params.McpConfig,
 			Gateway:     params.OpenclawGateway,
+			Model:       params.Model,
 			Logger:      logger,
 		})
 		if err != nil {

@@ -2051,6 +2051,61 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if rc := bytes.TrimSpace(agent.RuntimeConfig); len(rc) > 0 && !bytes.Equal(rc, []byte("{}")) && !bytes.Equal(rc, []byte("null")) {
 		runtimeConfig = json.RawMessage(agent.RuntimeConfig)
 	}
+
+	// Cerebra: Dynamic model selection based on prompt complexity
+	selectedModel := agent.Model.String // Default fallback
+	if h.CerebraRouter != nil {
+		// Extract prompt from task context
+		prompt := ""
+		if task.IssueID.Valid {
+			// For issue tasks, use issue title + description
+			if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
+				prompt = issue.Title
+				if issue.Description.Valid {
+					prompt = prompt + "\n\n" + issue.Description.String
+				}
+			}
+		} else if task.ChatSessionID.Valid {
+			// For chat tasks, get the latest user message
+			// (This is a simplified version - production would need the full chat context)
+			prompt = "chat task" // TODO: Extract from chat messages
+		}
+
+		if prompt != "" {
+			routeParams := cerebra.RouteParams{
+				RuntimeID:   uuid.MustParse(runtimeID),
+				WorkspaceID: uuid.MustParse(uuidToString(runtime.WorkspaceID)),
+				Prompt:      prompt,
+				StaticModel: agent.Model.String,
+			}
+			if task.IssueID.Valid {
+				issueUUID := uuid.MustParse(uuidToString(task.IssueID))
+				routeParams.IssueID = &issueUUID
+			}
+			if task.ChatSessionID.Valid {
+				chatUUID := uuid.MustParse(uuidToString(task.ChatSessionID))
+				routeParams.ChatSessionID = &chatUUID
+			}
+
+			if routeResult, err := h.CerebraRouter.Route(r.Context(), routeParams); err == nil {
+				if routeResult != nil && routeResult.Model != "" {
+					selectedModel = routeResult.Model
+					slog.Info("cerebra: dynamic model selected",
+						"task_id", uuidToString(task.ID),
+						"tier", routeResult.Tier,
+						"method", routeResult.RoutingMethod,
+						"model", routeResult.Model,
+						"static_model", agent.Model.String)
+				}
+			} else {
+				slog.Warn("cerebra: routing failed, using static model",
+					"task_id", uuidToString(task.ID),
+					"agent_id", uuidToString(agent.ID),
+					"error", err)
+			}
+		}
+	}
+
 	resp.Agent = &TaskAgentData{
 		ID:                    uuidToString(agent.ID),
 		Name:                  agent.Name,
@@ -2058,7 +2113,8 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		CustomEnv:             customEnv,
 		CustomArgs:            customArgs,
 		McpConfig:             mcpConfig,
-		Model:                 agent.Model.String,
+		Model:                 agent.Model.String, // Always use database agent ID (e.g., "nova"), NOT Cerebra-routed model
+		CerebraModel:          selectedModel,      // Cerebra-routed LLM model for config override (if different from Model)
 		ThinkingLevel:         agent.ThinkingLevel.String,
 		ServiceTier:           agent.ServiceTier.String,
 		RuntimeConfig:         runtimeConfig,
@@ -5237,15 +5293,30 @@ func (h *Handler) triggerModelDiscovery(ctx context.Context, runtimeID uuid.UUID
 		"models_count", len(models),
 	)
 
-	// Step 4: Convert to DiscoveredModel format
+	// Step 4: Convert to DiscoveredModel format (agent IDs from model list)
 	discoveredModels := make([]cerebra.DiscoveredModel, len(models))
 	for i, model := range models {
 		discoveredModels[i] = cerebra.DiscoveredModel{
 			ID:           model.ID,
 			Name:         model.Label,
 			InferredTier: cerebra.InferTierFromModelName(model.ID),
+			ModelType:    "agent", // Mark these as agent IDs
+			SourceAgent:  model.ID,
 		}
 	}
+
+	// TODO: Step 4.5: For OpenClaw runtimes, request actual model configuration
+	// This would require adding a new RPC endpoint to request ~/.openclaw/openclaw.json
+	// from the daemon and parse it to discover primary + fallback models.
+	// For now, we work with agent IDs only, but the infrastructure is ready
+	// to merge with actual model configs when available.
+	//
+	// Future implementation:
+	// if provider == "openclaw" {
+	//     openclawConfig := h.requestOpenClawConfig(ctx, runtimeIDStr)
+	//     openclawModels := cerebra.ParseOpenClawModels(openclawConfig)
+	//     discoveredModels = cerebra.deduplicateModels(append(discoveredModels, openclawModels...))
+	// }
 
 	// Step 5: Call discovery service to classify and assign tiers
 	discovery := cerebra.NewModelDiscovery(h.Queries)

@@ -17,6 +17,18 @@ type DiscoveredModel struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
 	InferredTier Tier   `json:"tier"`
+
+	// Provider is the model provider (e.g., "groq", "openrouter", "anthropic")
+	Provider string `json:"provider,omitempty"`
+
+	// ModelType indicates if this is a "primary", "fallback", or "agent" model
+	ModelType string `json:"model_type,omitempty"`
+
+	// SourceAgent is the agent ID this model came from (for OpenClaw agents like "nova", "iris")
+	SourceAgent string `json:"source_agent,omitempty"`
+
+	// CostTier classifies the model by cost: "free", "paid", "premium"
+	CostTier string `json:"cost_tier,omitempty"`
 }
 
 // ModelDiscovery handles automatic model discovery and tier assignment
@@ -87,27 +99,77 @@ func (md *ModelDiscovery) DiscoverAndAssignTiers(ctx context.Context, runtimeID 
 // buildTierMap selects the best model for each tier from discovered models
 //
 // Strategy:
-// - For each tier (simple, standard, heavy), find all models in that tier
-// - Select the "best" model based on a preference order
-// - Preference: flagship models > balanced models > specialized models
+// - Group models by tier AND cost (free, paid, premium)
+// - For simple tier: prefer free models (cost optimization)
+// - For standard tier: prefer paid models (balanced performance)
+// - For heavy tier: prefer premium models (maximum capability)
+// - Use preference-based selection within each cost category
 func (md *ModelDiscovery) buildTierMap(models []DiscoveredModel) map[string]string {
 	tierMap := make(map[string]string)
 
-	// Group models by tier
-	modelsByTier := make(map[Tier][]DiscoveredModel)
+	// Group models by tier AND cost
+	type TierModels struct {
+		Free    []DiscoveredModel
+		Paid    []DiscoveredModel
+		Premium []DiscoveredModel
+	}
+	modelsByTier := make(map[Tier]TierModels)
+
 	for _, model := range models {
-		modelsByTier[model.InferredTier] = append(modelsByTier[model.InferredTier], model)
+		tm := modelsByTier[model.InferredTier]
+		switch model.CostTier {
+		case "free":
+			tm.Free = append(tm.Free, model)
+		case "premium":
+			tm.Premium = append(tm.Premium, model)
+		default: // "paid" or empty (treat as paid)
+			tm.Paid = append(tm.Paid, model)
+		}
+		modelsByTier[model.InferredTier] = tm
 	}
 
-	// Select best model for each tier
-	for tier, tierModels := range modelsByTier {
-		if len(tierModels) == 0 {
-			continue
+	// Select best model for each tier with cost-aware preferences
+	for tier, models := range modelsByTier {
+		var selected DiscoveredModel
+
+		switch tier {
+		case TierSimple:
+			// Simple tier: prefer free models for cost optimization
+			// Fallback: paid > premium (use cheapest available)
+			if len(models.Free) > 0 {
+				selected = md.selectBestModel(models.Free, tier)
+			} else if len(models.Paid) > 0 {
+				selected = md.selectBestModel(models.Paid, tier)
+			} else if len(models.Premium) > 0 {
+				selected = md.selectBestModel(models.Premium, tier)
+			}
+
+		case TierStandard:
+			// Standard tier: prefer paid models for balanced performance
+			// Fallback: premium > free (prioritize quality over cost)
+			if len(models.Paid) > 0 {
+				selected = md.selectBestModel(models.Paid, tier)
+			} else if len(models.Premium) > 0 {
+				selected = md.selectBestModel(models.Premium, tier)
+			} else if len(models.Free) > 0 {
+				selected = md.selectBestModel(models.Free, tier)
+			}
+
+		case TierHeavy:
+			// Heavy tier: prefer premium models for maximum capability
+			// Fallback: paid > free (prioritize performance)
+			if len(models.Premium) > 0 {
+				selected = md.selectBestModel(models.Premium, tier)
+			} else if len(models.Paid) > 0 {
+				selected = md.selectBestModel(models.Paid, tier)
+			} else if len(models.Free) > 0 {
+				selected = md.selectBestModel(models.Free, tier)
+			}
 		}
 
-		// Use preference-based selection
-		bestModel := md.selectBestModel(tierModels, tier)
-		tierMap[string(tier)] = bestModel.ID
+		if selected.ID != "" {
+			tierMap[string(tier)] = selected.ID
+		}
 	}
 
 	return tierMap

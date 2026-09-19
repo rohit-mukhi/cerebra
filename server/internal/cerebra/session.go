@@ -23,7 +23,8 @@ func NewSessionAffinity(db *sql.DB) *SessionAffinity {
 }
 
 // CheckAffinity checks if a session already has a model and whether to reuse it
-// Returns (sessionModel, shouldEscalate, error)
+// Returns (sessionModel, shouldSwitch, error)
+// shouldSwitch = true means routing should select a different model (escalate OR de-escalate)
 func (sa *SessionAffinity) CheckAffinity(ctx context.Context, params RouteParams) (string, bool, error) {
 	var sessionModel sql.NullString
 	var err error
@@ -45,16 +46,17 @@ func (sa *SessionAffinity) CheckAffinity(ctx context.Context, params RouteParams
 		return "", false, nil
 	}
 
-	// Check if new prompt requires escalation
+	// Check if new prompt requires a different tier (escalate OR de-escalate)
 	newTier := sa.scorer.Score(params.Prompt)
-	shouldEscalate := sa.shouldEscalate(sessionModel.String, newTier)
+	shouldSwitch := sa.shouldSwitchModel(sessionModel.String, newTier)
 
-	return sessionModel.String, shouldEscalate, nil
+	return sessionModel.String, shouldSwitch, nil
 }
 
-// shouldEscalate determines if the new prompt complexity requires a stronger model
-// Session affinity only escalates, never de-escalates
-func (sa *SessionAffinity) shouldEscalate(sessionModel string, newTier Tier) bool {
+// shouldSwitchModel determines if the new prompt complexity requires a different model
+// Enables both escalation (simple → heavy) and de-escalation (heavy → simple)
+// for maximum cost efficiency while maintaining conversation quality
+func (sa *SessionAffinity) shouldSwitchModel(sessionModel string, newTier Tier) bool {
 	// Infer session model tier from name pattern
 	sessionTier := inferTierFromModelName(sessionModel)
 
@@ -68,13 +70,17 @@ func (sa *SessionAffinity) shouldEscalate(sessionModel string, newTier Tier) boo
 	sessionRank := tierRank[sessionTier]
 	newRank := tierRank[newTier]
 
-	// Escalate if new tier is higher
-	return newRank > sessionRank
+	// Switch if tiers differ (escalate OR de-escalate)
+	// Examples:
+	// - heavy → simple: switch to save cost
+	// - simple → heavy: switch for more capability
+	// - standard → standard: no switch (stay on same tier)
+	return newRank != sessionRank
 }
 
 // getIssueSessionModel retrieves the session_model for an issue
 func (sa *SessionAffinity) getIssueSessionModel(ctx context.Context, issueID uuid.UUID) (sql.NullString, error) {
-	query := `SELECT session_model FROM issues WHERE id = $1`
+	query := `SELECT session_model FROM issue WHERE id = $1`
 	var model sql.NullString
 	err := sa.db.QueryRowContext(ctx, query, issueID).Scan(&model)
 	if err != nil {
@@ -96,7 +102,7 @@ func (sa *SessionAffinity) getChatSessionModel(ctx context.Context, chatSessionI
 
 // SetIssueSessionModel sets the session_model for an issue
 func (sa *SessionAffinity) SetIssueSessionModel(ctx context.Context, issueID uuid.UUID, model string) error {
-	query := `UPDATE issues SET session_model = $2 WHERE id = $1`
+	query := `UPDATE issue SET session_model = $2 WHERE id = $1`
 	_, err := sa.db.ExecContext(ctx, query, issueID, model)
 	return err
 }
@@ -110,7 +116,7 @@ func (sa *SessionAffinity) SetChatSessionModel(ctx context.Context, chatSessionI
 
 // ClearIssueSessionModel clears the session_model for an issue (e.g., when issue is closed)
 func (sa *SessionAffinity) ClearIssueSessionModel(ctx context.Context, issueID uuid.UUID) error {
-	query := `UPDATE issues SET session_model = NULL WHERE id = $1`
+	query := `UPDATE issue SET session_model = NULL WHERE id = $1`
 	_, err := sa.db.ExecContext(ctx, query, issueID)
 	return err
 }
@@ -129,14 +135,22 @@ func inferTierFromModelName(modelID string) Tier {
 		lower = modelID
 	}
 
-	simplePatterns := []string{"mini", "haiku", "flash", "nano", "small", "lite"}
+	// Simple tier indicators (free/small models)
+	simplePatterns := []string{
+		"mini", "haiku", "flash", "nano", "small", "lite",
+		"free", "8b", "instant", "micro", // Enhanced for Option B
+	}
 	for _, pattern := range simplePatterns {
 		if contains(lower, pattern) {
 			return TierSimple
 		}
 	}
 
-	heavyPatterns := []string{"opus", "large", "ultra", "max", "plus", "pro"}
+	// Heavy tier indicators (premium models)
+	heavyPatterns := []string{
+		"opus", "large", "ultra", "max", "plus", "pro",
+		"70b", "405b", // Enhanced for Option B
+	}
 	for _, pattern := range heavyPatterns {
 		if contains(lower, pattern) {
 			return TierHeavy
@@ -165,14 +179,14 @@ func contains(s, substr string) bool {
 			subLower += string(r)
 		}
 	}
-	
+
 	if len(subLower) == 0 {
 		return true
 	}
 	if len(sLower) < len(subLower) {
 		return false
 	}
-	
+
 	for i := 0; i <= len(sLower)-len(subLower); i++ {
 		if sLower[i:i+len(subLower)] == subLower {
 			return true

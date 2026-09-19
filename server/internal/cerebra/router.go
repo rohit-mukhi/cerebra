@@ -12,35 +12,36 @@ import (
 
 // Router orchestrates the two-pass routing: semantic → tier → fallback
 type Router struct {
-	db                *sql.DB
-	scorer            *Scorer
-	unavailability    *UnavailabilityCache
-	sessionAffinity   *SessionAffinity
+	db              *sql.DB
+	scorer          *Scorer
+	unavailability  *UnavailabilityCache
+	sessionAffinity *SessionAffinity
 }
 
 // NewRouter creates a new Cerebra router
 func NewRouter(db *sql.DB) *Router {
 	return &Router{
-		db:                db,
-		scorer:            NewScorer(),
-		unavailability:    NewUnavailabilityCache(db),
-		sessionAffinity:   NewSessionAffinity(db),
+		db:              db,
+		scorer:          NewScorer(),
+		unavailability:  NewUnavailabilityCache(db),
+		sessionAffinity: NewSessionAffinity(db),
 	}
 }
 
 // RouteParams contains all parameters needed for routing
 type RouteParams struct {
-	Prompt       string
-	RuntimeID    uuid.UUID
-	WorkspaceID  uuid.UUID
-	StaticModel  string // Fallback model from agent config
-	IssueID      *uuid.UUID
+	Prompt        string
+	RuntimeID     uuid.UUID
+	WorkspaceID   uuid.UUID
+	StaticModel   string // Fallback model from agent config
+	IssueID       *uuid.UUID
 	ChatSessionID *uuid.UUID
 }
 
 // RouteResult contains the routing decision
 type RouteResult struct {
 	Model          string
+	Provider       string // Model provider (e.g., "groq", "openrouter", "anthropic")
 	RuntimeID      uuid.UUID
 	RoutingMethod  string // "semantic", "tier", "session_affinity", "static", "fallback"
 	Tier           Tier
@@ -55,14 +56,15 @@ func (r *Router) Route(ctx context.Context, params RouteParams) (*RouteResult, e
 	}
 
 	// Check session affinity first - if a session already has a model, reuse it
-	// unless the new prompt requires escalation
+	// unless the new prompt requires switching (escalation or de-escalation)
 	if params.IssueID != nil || params.ChatSessionID != nil {
-		sessionModel, escalate, err := r.sessionAffinity.CheckAffinity(ctx, params)
+		sessionModel, shouldSwitch, err := r.sessionAffinity.CheckAffinity(ctx, params)
 		if err != nil {
 			// Log error but don't fail routing
 			fmt.Printf("cerebra: session affinity check failed: %v\n", err)
-		} else if sessionModel != "" && !escalate {
+		} else if sessionModel != "" && !shouldSwitch {
 			result.Model = sessionModel
+			result.Provider = extractProvider(sessionModel)
 			result.RoutingMethod = "session_affinity"
 			return result, nil
 		}
@@ -85,6 +87,7 @@ func (r *Router) Route(ctx context.Context, params RouteParams) (*RouteResult, e
 			// Check if model is available
 			if r.unavailability.IsAvailable(ctx, params.RuntimeID, matchResult.Model) {
 				result.Model = matchResult.Model
+				result.Provider = extractProvider(matchResult.Model)
 				result.RoutingMethod = "semantic"
 				result.SemanticDomain = matchResult.Domain
 				result.Confidence = matchResult.Confidence
@@ -117,6 +120,7 @@ func (r *Router) Route(ctx context.Context, params RouteParams) (*RouteResult, e
 			// Check if model is available
 			if r.unavailability.IsAvailable(ctx, params.RuntimeID, tierModel) {
 				result.Model = tierModel
+				result.Provider = extractProvider(tierModel)
 				result.RoutingMethod = "tier"
 
 				// Update session affinity if applicable
@@ -158,7 +162,7 @@ func (r *Router) Route(ctx context.Context, params RouteParams) (*RouteResult, e
 // getRuntimeModelMaps fetches tier_model_map and semantic_model_map from DB
 func (r *Router) getRuntimeModelMaps(ctx context.Context, runtimeID uuid.UUID) (map[string]string, map[string]string, error) {
 	query := `SELECT tier_model_map, semantic_model_map FROM agent_runtime WHERE id = $1`
-	
+
 	var tierMapJSON, semanticMapJSON sql.NullString
 	err := r.db.QueryRowContext(ctx, query, runtimeID).Scan(&tierMapJSON, &semanticMapJSON)
 	if err != nil {
@@ -186,7 +190,7 @@ func (r *Router) getRuntimeModelMaps(ctx context.Context, runtimeID uuid.UUID) (
 // findCrossRuntimeFallback scans other runtimes in the workspace for the same model
 func (r *Router) findCrossRuntimeFallback(ctx context.Context, workspaceID uuid.UUID, targetModel string, excludeRuntimeID uuid.UUID) (string, uuid.UUID) {
 	query := `SELECT id, tier_model_map, semantic_model_map FROM agent_runtime WHERE workspace_id = $1 AND id != $2`
-	
+
 	rows, err := r.db.QueryContext(ctx, query, workspaceID, excludeRuntimeID)
 	if err != nil {
 		return "", uuid.Nil
@@ -196,7 +200,7 @@ func (r *Router) findCrossRuntimeFallback(ctx context.Context, workspaceID uuid.
 	for rows.Next() {
 		var runtimeID uuid.UUID
 		var tierMapJSON, semanticMapJSON sql.NullString
-		
+
 		if err := rows.Scan(&runtimeID, &tierMapJSON, &semanticMapJSON); err != nil {
 			continue
 		}
@@ -262,27 +266,35 @@ func (r *Router) inferTierFromModelName(modelID string) Tier {
 // This is used for automatic tier assignment during model discovery.
 //
 // Tier Heavy: flagship models (opus, o1, o3, gpt-4, claude-3.5-sonnet, gemini-pro)
-// Tier Standard: balanced models (gpt-4o, claude-3-sonnet, gemini-flash)  
+// Tier Standard: balanced models (gpt-4o, claude-3-sonnet, gemini-flash)
 // Tier Simple: fast/cheap models (mini, haiku, nano, 3.5-turbo)
 func InferTierFromModelName(modelID string) Tier {
 	lower := strings.ToLower(modelID)
 
+	// PRIORITY 1: Parameter-based tier inference (most accurate)
+	// Extract parameter count from model name and classify by size
+	paramTier := inferTierFromParameters(lower)
+	if paramTier != TierStandard { // If we got a definitive answer (not default)
+		return paramTier
+	}
+
+	// PRIORITY 2: Keyword-based patterns (fallback for models without explicit parameters)
 	// Heavy tier: Most capable/expensive models
 	heavyPatterns := []string{
-		"opus",           // claude-3-opus, claude-3.5-opus
-		"o1-preview",     // gpt-o1-preview
-		"o1-mini",        // Actually more capable than gpt-4o-mini
-		"o3",             // OpenAI o3 series
-		"gpt-4-turbo",    // gpt-4-turbo-preview
-		"gpt-4-32k",      // Large context GPT-4
+		"opus",              // claude-3-opus, claude-3.5-opus
+		"o1-preview",        // gpt-o1-preview
+		"o1-mini",           // Actually more capable than gpt-4o-mini
+		"o3",                // OpenAI o3 series
+		"gpt-4-turbo",       // gpt-4-turbo-preview
+		"gpt-4-32k",         // Large context GPT-4
 		"claude-3.5-sonnet", // Claude 3.5 Sonnet (higher tier)
-		"gemini-pro",     // Google Gemini Pro
-		"gemini-ultra",   // Google Gemini Ultra
-		"command-r-plus", // Cohere flagship
-		"large",          // Generic large models
+		"gemini-pro",        // Google Gemini Pro
+		"gemini-ultra",      // Google Gemini Ultra
+		"command-r-plus",    // Cohere flagship
+		"large",             // Generic large models
 		"ultra",
 		"max",
-		"pro-",           // e.g., gemini-1.5-pro
+		"pro-", // e.g., gemini-1.5-pro
 	}
 	for _, pattern := range heavyPatterns {
 		if strings.Contains(lower, pattern) {
@@ -290,7 +302,7 @@ func InferTierFromModelName(modelID string) Tier {
 		}
 	}
 
-	// Simple tier: Fast, cheap models
+	// Simple tier: Fast, cheap, and free models
 	simplePatterns := []string{
 		"mini",           // gpt-4o-mini, gpt-3.5-turbo-mini
 		"haiku",          // claude-3-haiku, claude-3.5-haiku
@@ -301,6 +313,9 @@ func InferTierFromModelName(modelID string) Tier {
 		"small",          // Generic small models
 		"lite",           // Lightweight variants
 		"turbo-instruct", // gpt-3.5-turbo-instruct
+		"free",           // Explicit free models (e.g., openrouter/free)
+		"instant",        // Fast/instant models (e.g., llama-3.1-8b-instant)
+		"micro",          // Micro models
 	}
 	for _, pattern := range simplePatterns {
 		if strings.Contains(lower, pattern) {
@@ -311,6 +326,136 @@ func InferTierFromModelName(modelID string) Tier {
 	// Standard tier: Everything else (balanced models)
 	// Examples: gpt-4o, claude-3-sonnet, gemini-1.5-flash, command-r
 	return TierStandard
+}
+
+// inferTierFromParameters extracts parameter count from model name and assigns tier
+// Tier classification:
+//   - Heavy: 70B+ parameters (e.g., llama-3.3-70b, mixtral-8x22b, qwen-72b)
+//   - Standard: 7B-69B parameters (e.g., llama-3.1-8b, mistral-7b, gemma-7b)
+//   - Simple: <7B parameters (e.g., phi-3-mini, gemma-2b, stablelm-3b)
+//
+// Examples:
+//   - "groq/llama-3.3-70b-versatile" → TierHeavy
+//   - "groq/llama-3.1-8b-instant" → TierStandard
+//   - "mistral-7b" → TierStandard
+//   - "phi-3-mini-3b" → TierSimple
+//   - "openrouter/phi-3-mini-128k" → TierSimple (mini implies small)
+//   - "mixtral-8x22b" → TierHeavy (8x22b = 176B effective)
+func inferTierFromParameters(modelID string) Tier {
+	// Look for parameter count patterns: XXXb, XXXm, XX.Xb, etc.
+	// Common patterns: 70b, 8b, 7b, 3b, 2b, 1.5b, etc.
+
+	// Regex-free approach: scan for number followed by 'b' or 'm'
+	// Handle cases like: 70b, 8b, 3.5b, 1.5b, 0.5b, 7m (7 million = 0.007b)
+
+	for i := 0; i < len(modelID); i++ {
+		// Look for digit
+		if modelID[i] >= '0' && modelID[i] <= '9' {
+			// Extract the full number (handle decimals)
+			start := i
+			hasDecimal := false
+			for i < len(modelID) && (modelID[i] >= '0' && modelID[i] <= '9' || modelID[i] == '.') {
+				if modelID[i] == '.' {
+					if hasDecimal {
+						break // Second decimal point, stop
+					}
+					hasDecimal = true
+				}
+				i++
+			}
+
+			// Check if followed by 'b' (billions) or 'm' (millions)
+			if i < len(modelID) && (modelID[i] == 'b' || modelID[i] == 'm') {
+				numStr := modelID[start:i]
+				unit := modelID[i]
+
+				// Check for "x" multiplier pattern (e.g., 8x22b in mixtral-8x22b)
+				// This indicates mixture of experts: 8 experts x 22B each
+				multiplier := 1.0
+				if start > 0 && start-1 >= 0 && modelID[start-1] == 'x' {
+					// Look backwards for the multiplier
+					j := start - 2
+					for j >= 0 && modelID[j] >= '0' && modelID[j] <= '9' {
+						j--
+					}
+					if j < start-2 {
+						// Found multiplier
+						multStr := modelID[j+1 : start-1]
+						if mult, err := parseFloat(multStr); err == nil {
+							multiplier = mult
+						}
+					}
+				}
+
+				// Parse the number
+				if params, err := parseFloat(numStr); err == nil {
+					// Convert to billions
+					paramsBillions := params
+					if unit == 'm' {
+						paramsBillions = params / 1000.0 // Convert millions to billions
+					}
+
+					// Apply multiplier for MoE models
+					paramsBillions *= multiplier
+
+					// Classify by parameter count
+					// Heavy: 70B+
+					if paramsBillions >= 70.0 {
+						return TierHeavy
+					}
+					// Standard: 7B-69B (inclusive of common 7B models)
+					if paramsBillions >= 7.0 {
+						return TierStandard
+					}
+					// Simple: <7B (small models)
+					return TierSimple
+				}
+			}
+		}
+	}
+
+	// No parameter count found, return standard (caller will try keyword patterns)
+	return TierStandard
+}
+
+// parseFloat is a simple float parser for model parameter extraction
+// Handles formats like: "70", "8", "3.5", "1.5", "0.5"
+func parseFloat(s string) (float64, error) {
+	var result float64
+	var decimal float64
+	var decimalPlaces int
+	inDecimal := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			digit := float64(c - '0')
+			if inDecimal {
+				decimalPlaces++
+				decimal = decimal*10 + digit
+			} else {
+				result = result*10 + digit
+			}
+		} else if c == '.' {
+			if inDecimal {
+				return 0, fmt.Errorf("multiple decimal points")
+			}
+			inDecimal = true
+		} else {
+			return 0, fmt.Errorf("invalid character: %c", c)
+		}
+	}
+
+	// Combine integer and decimal parts
+	if inDecimal && decimalPlaces > 0 {
+		divisor := 1.0
+		for i := 0; i < decimalPlaces; i++ {
+			divisor *= 10
+		}
+		result += decimal / divisor
+	}
+
+	return result, nil
 }
 
 // updateSessionModel updates the session_model for the issue or chat session

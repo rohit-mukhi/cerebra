@@ -2418,7 +2418,119 @@ func discoverOpenclawAgents(ctx context.Context, runtimeCmd Command) ([]Model, e
 	if err != nil && len(out) == 0 {
 		return []Model{}, nil
 	}
-	return parseOpenclawAgents(string(out)), nil
+	agentModels := parseOpenclawAgents(string(out))
+
+	// ENHANCED: Also discover actual configured models from OpenClaw config
+	// This enables Cerebra to know about primary + fallback models, not just agent IDs
+	configModels := discoverOpenclawConfigModels(ctx, runtimeCmd)
+
+	// Merge agent IDs with actual models (prefer config models for richer metadata)
+	return mergeOpenclawModels(agentModels, configModels), nil
+}
+
+// discoverOpenclawConfigModels reads OpenClaw's configuration to extract
+// the actual models configured (primary + fallbacks), not just agent IDs.
+// This enables Cerebra to perform accurate tier-based routing.
+func discoverOpenclawConfigModels(ctx context.Context, runtimeCmd Command) []Model {
+	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Read the full resolved config via `openclaw config get --json`
+	cmd := runtimeCmd.exec(runCtx, "config", "get", "agents.defaults.model", "--json")
+	hideAgentWindow(cmd)
+	out, err := cmd.Output()
+	if err != nil || len(out) == 0 {
+		// Config reading failed or not supported - return empty (non-fatal)
+		return []Model{}
+	}
+
+	// Parse the model configuration
+	var modelConfig struct {
+		Primary   string   `json:"primary"`
+		Fallbacks []string `json:"fallbacks"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &modelConfig); err != nil {
+		// Invalid JSON or unexpected structure - return empty (non-fatal)
+		return []Model{}
+	}
+
+	models := []Model{}
+
+	// Add primary model
+	if modelConfig.Primary != "" {
+		models = append(models, Model{
+			ID:       modelConfig.Primary,
+			Label:    formatModelLabel(modelConfig.Primary, "primary"),
+			Provider: extractProviderFromModel(modelConfig.Primary),
+			Default:  true, // Primary is the default
+		})
+	}
+
+	// Add fallback models
+	for i, fallback := range modelConfig.Fallbacks {
+		if fallback == "" {
+			continue
+		}
+		models = append(models, Model{
+			ID:       fallback,
+			Label:    formatModelLabel(fallback, fmt.Sprintf("fallback %d", i+1)),
+			Provider: extractProviderFromModel(fallback),
+			Default:  false,
+		})
+	}
+
+	return models
+}
+
+// mergeOpenclawModels combines agent IDs with actual configured models.
+// Strategy: Keep both agent IDs (for backward compatibility) and models
+// (for accurate Cerebra routing). De-duplicate if an agent ID matches a model ID.
+func mergeOpenclawModels(agentModels, configModels []Model) []Model {
+	if len(configModels) == 0 {
+		// No config models discovered, return agent IDs only
+		return agentModels
+	}
+
+	// Build map of existing models by ID to avoid duplicates
+	seen := make(map[string]bool)
+	result := make([]Model, 0, len(agentModels)+len(configModels))
+
+	// Add config models first (they have richer metadata)
+	for _, model := range configModels {
+		if !seen[model.ID] {
+			result = append(result, model)
+			seen[model.ID] = true
+		}
+	}
+
+	// Add agent IDs that aren't already present
+	for _, model := range agentModels {
+		if !seen[model.ID] {
+			result = append(result, model)
+			seen[model.ID] = true
+		}
+	}
+
+	return result
+}
+
+// formatModelLabel creates a human-readable label for a model ID
+func formatModelLabel(modelID, roleHint string) string {
+	// Extract the model name from provider/model format
+	parts := strings.Split(modelID, "/")
+	if len(parts) == 2 {
+		return fmt.Sprintf("%s (%s, %s)", parts[1], parts[0], roleHint)
+	}
+	return fmt.Sprintf("%s (%s)", modelID, roleHint)
+}
+
+// extractProviderFromModel extracts the provider name from a model ID
+func extractProviderFromModel(modelID string) string {
+	parts := strings.Split(modelID, "/")
+	if len(parts) >= 1 {
+		return parts[0]
+	}
+	return ""
 }
 
 // openclawAgentEntry is the shape parseOpenclawAgentsJSON expects

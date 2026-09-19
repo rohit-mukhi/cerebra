@@ -61,6 +61,13 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 			r.Header.Del("X-Actor-Source")
 
 			tokenString, fromCookie := extractToken(r)
+			
+			// Dev mode bypass: accept a special dev token when MULTICA_DEV_MODE=true
+			if devUserID := auth.ValidateDevToken(tokenString); devUserID != "" {
+				r.Header.Set("X-User-ID", devUserID)
+				next.ServeHTTP(w, r)
+				return
+			}
 			if tokenString == "" {
 				slog.Debug("auth: no token found", "path", r.URL.Path)
 				http.Error(w, `{"error":"missing authorization"}`, http.StatusUnauthorized)
